@@ -1,103 +1,175 @@
+import torch
 from smac.env import StarCraft2Env
 import numpy as np
-from agent import AgentVDN, AgentQMIX, AgentBase
 import argparse
+from agent import VDN_Agent
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 
-comarl_algorithm_list = ['VDN', 'QMIX']
-privacy_building_block_list = ['centralized', 'decentralized', 'decentralized_SMC', 'decentralized_DP', 'Decentralized_SMC_DPSGD']
-map_name_list = ['8m']
 
-# Takes the joint observation and returns a specific agent's observation
-def local_observation_mapping(obs, agent_id):
-    return obs[agent_id]
+class VDN_Runner(object):
+    def __init__(self, args, env_name, exp_id, seed, privacy_mechanism = None):
+        self.args = args
+        self.env_name = env_name
+        self.exp_id = exp_id
+        self.device = args.device
+        self.seed = seed
+        self.privacy_mechanism = privacy_mechanism
+        self.env = StarCraft2Env(map_name=env_name, seed = self.seed)
+        self.env_info = self.env.get_env_info()
+        self.args.n_agents = self.env_info["n_agents"]
+        self.n_agents = self.env_info["n_agents"]
+        self.args.obs_dim = self.env_info["obs_shape"]  # The dimensions of an agent's observation space
+        self.args.action_dim = self.env_info["n_actions"]  # The dimensions of an agent's action space
+        self.args.episode_limit = self.env_info["episode_limit"]  # Maximum number of steps per episode
+        print("number of agents={}".format(self.args.n_agents))
+        print("obs_dim={}".format(self.args.obs_dim))
+        print("action_dim={}".format(self.args.action_dim))
+        print("episode_limit={}".format(self.args.episode_limit))
+        self.epsilon = self.args.epsilon
 
-# Picks a set of indices for the minibatch elements in every iteration
-def minibatch_indices(buffer_size, batch_size):   
-    return np.random.choice(buffer_size, batch_size, replace = False)
+        _, self.seed = self.branch_seed(self.seed)
+        # create n_agents VDN agents
+        self.agents = [VDN_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
 
-def decentralized_runner(args, env, comarl_algorithm = 'VDN', n_episodes = 10, minibatch_size = 128, target_update_frequency = 1000):
-    
-    env_info = env.get_env_info()
-    env_info = env.get_env_info()
-    n_agents = env_info["n_agents"]  # The number of agents
-    args.obs_dim = env_info["obs_shape"]  # The dimensions of an agent's observation space
-    args.state_dim = env_info["state_shape"]  # The dimensions of global state space
-    args.action_dim = env_info["n_actions"]  # The dimensions of an agent's action space
-    args.episode_limit = env_info["episode_limit"]  # Maximum number of steps per episode
-    print("number of agents={}".format(n_agents))
-    print("obs_dim={}".format(args.obs_dim))
-    print("state_dim={}".format(args.state_dim))
-    print("action_dim={}".format(args.action_dim))
-    print("episode_limit={}".format(args.episode_limit))
+        # creat a tensorboard
+        self.writer = SummaryWriter(log_dir="./log/{}_{}_{}".format(self.args.algorithm, env_name, exp_id))
 
-    # agents = []
-    # for agent_id in range(n_agents):
-    #     if comarl_algorithm == 'VDN':
-    #         agents.append(AgentVDN(args))
-    #     elif comarl_algorithm == 'QMIX':
-    #         agents.append(AgentQMIX(args))
-    #     else:
-    #         print('Co-MARL algorithm not supported. Try VDN or QMIX. Current algorithm: {}'.format(comarl_algorithm))
+        self.win_rates = []
+        self.total_steps = 0
 
-    args.use_history_encoding = False
+    def branch_seed(self, current_seed, number_of_branches = 1):
+        """
+        This function is used to generate different seeds for different branches
+        """
+        np.random.seed(current_seed)
+        random_seeds = np.random.randint(0, 2 ** 32 - 1, number_of_branches + 1)
+        return random_seeds[:-1], random_seeds[-1]
 
-    agents = [AgentBase(args) for _ in range(n_agents)]
+    def run(self):
+        evaluate_num = -1
+        pbar = tqdm(total = self.total_steps)
+        while self.total_steps < self.args.max_train_steps:
+            if self.total_steps // self.args.evaluate_freq > evaluate_num:
+                self.evaluate_policy()
+                evaluate_num += 1
 
-    for e in range(n_episodes):
-        env.reset()
-        terminated = False
+            _, _, episode_steps = self.run_episode_smac(evaluate = False)
+            self.total_steps += episode_steps
+            pbar.update(episode_steps)
+
+            
+            # start training if all agent replay buffer has enough samples
+            if min([agent.replay_buffer.current_size for agent in self.agents]) >= self.args.batch_size:
+                #create an np array of size batch_size * n_agents (sender) * n_agents (receiver)
+                
+                for agent in self.agents:
+                    agent.peer2peer_messaging(self.seed, mode = '0. initiate')
+                for agent in self.agents:
+                    agent.peer2peer_messaging(self.seed, mode = '1. compute message')
+                local_sums = []
+                for receiver_agent in self.agents:
+                    for sender_agent in self.agents:
+                        receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
+                local_sums = torch.stack(local_sums)
+                sum_shares = torch.sum(local_sums, dim = 0)
+                        
+                for agent in self.agents:
+                    agent.train(self.total_steps, sum_shares)
+                _, self.seed = self.branch_seed(self.seed)
+
+
+        self.evaluate_policy()
+        self.env.close()
+        tqdm.close()
+
+    def evaluate_policy(self):
+        win_times = 0
+        evaluate_reward = 0
+        for _ in range(self.args.evaluate_times):
+            win_tag, episode_reward, _ = self.run_episode_smac(evaluate=True)
+            if win_tag:
+                win_times += 1
+            evaluate_reward += episode_reward
+
+        win_rate = win_times / self.args.evaluate_times
+        evaluate_reward = evaluate_reward / self.args.evaluate_times
+        self.win_rates.append(win_rate)
+        print("total_steps:{} \t win_rate:{} \t evaluate_reward:{}".format(self.total_steps, win_rate, evaluate_reward))
+        self.writer.add_scalar('win_rate_{}'.format(self.env_name), win_rate, global_step=self.total_steps)
+        # Save the win rates
+        np.save('./data_train/{}_env_{}_number_{}_seed_{}.npy'.format(self.args.algorithm, self.env_name, self.exp_id, self.seed), np.array(self.win_rates))
+
+    def run_episode_smac(self, evaluate=False):
+        win_tag = False
         episode_reward = 0
-        transition_id = 0
+        self.env.reset()
+        for agent in self.agents:
+            if self.args.use_rnn:
+                agent.q_network.init_hidden()
+        joint_last_onehot_a = np.zeros((self.n_agents, self.args.action_dim))
 
-        if args.use_rnn == True:
-            for agent in agents:
-                agent.eval_Q_net.reset_rnn_hidden()
+        for episode_step in range(self.args.episode_limit):
+            # get observations
+            joint_obs = self.env.get_obs()
+            joint_avail_a = self.env.get_avail_actions()
+            epsilon = 0 if evaluate else self.epsilon
+            joint_action = [agent.choose_action(joint_obs[agent.id], joint_last_onehot_a[agent.id], joint_avail_a[agent.id], epsilon) for agent in self.agents]
+            joint_last_onehot_a = np.eye(self.args.action_dim)[joint_action]
 
-        while not terminated:
-            obs = env.get_obs()
-            # state = env.get_state()
-            # env.render()  # Uncomment for rendering
+            r, done, info = self.env.step(joint_action)
+            win_tag = True if done and 'battle_won' in info and info['battle_won'] else False
+            episode_reward += r
+
+            if not evaluate:
+                if done and episode_step + 1 != self.args.episode_limit:
+                    dw = True
+                else:    
+                    dw = False
+
+                for agent in self.agents:
+                    
+                    agent.replay_buffer.store_transition(
+                        episode_step = episode_step,
+                        obs = joint_obs[agent.id],
+                        avail_a = joint_avail_a[agent.id],
+                        last_onehot_a = joint_last_onehot_a[agent.id],
+                        a = joint_action[agent.id],
+                        r = r,
+                        dw = dw
+                        )
+                        
+
+                self.epsilon = self.epsilon - self.args.epsilon_decay if self.epsilon - self.args.epsilon_decay > self.args.epsilon_min else self.args.epsilon_min
+
+            if done:
+                break
+
+        if not evaluate:
+            joint_obs = self.env.get_obs()
+            joint_avail_a = self.env.get_avail_actions()
+            for agents in self.agents:
+                agents.replay_buffer.store_last_step(
+                    episode_step = episode_step,
+                    obs = joint_obs[agents.id],
+                    avail_a = joint_avail_a[agents.id]
+                    )
+
+        return win_tag, episode_reward, episode_step + 1
+    
+
+
             
-            joint_action = []
-            # Agents make observations and choose actions
-            for agent_id, agent in enumerate(agents):
-                local_obs = local_observation_mapping(obs, agent_id)
-                agent.receive_observation(local_obs)
-                available_actions = env.get_avail_agent_actions(agent_id)
-                action, q_value = agent.choose_action(local_obs, available_actions, args.epsilon)
-                joint_action.append(action)
-            
-            # Team receives rewards and environment transitions
-            team_reward, terminated, _ = env.step(joint_action)
-            episode_reward += team_reward
 
-            next_obs = env.get_obs()
+        
+                
 
-            """for every agent, save (last_action, last_local_obs), team_reward, terminated, action, (action, local_obs) to its buffer"""
-            for agent_id, agent in enumerate(agents):
 
-                agent.receive_reward(team_reward)
-                agent.receive_terminated(terminated)
-                agent.receive_next_observation(next_obs[agent_id])
-                agent.update_buffer(transition_id)
 
-            for sender_agent in agents:
-                for recipient_agent in agents:
-                    message = sender_agent.send_message(method = 'decentralized')
-                    recipient_agent.receive_message(message, method = 'decentralized')
-            
-            # Agents perform local updates
-            if transition_id >= minibatch_size:
-                for agent in agents:
-                    agent.update(minibatch_indices())
-                    if transition_id % target_update_frequency == 0:
-                        agent.update_target_network()
 
-        print("Total reward in episode {} = {}".format(e, episode_reward))
-        transition_id += 1
 
-    env.close()
 
 
 if __name__ == '__main__':
@@ -107,7 +179,7 @@ if __name__ == '__main__':
     parser.add_argument("--evaluate_times", type=float, default=32, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
 
-    parser.add_argument("--algorithm", type=str, default="QMIX", help="QMIX or VDN")
+    parser.add_argument("--algorithm", type=str, default="VDN", help="QMIX or VDN")
     parser.add_argument("--epsilon", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon_decay_steps", type=float, default=50000, help="How many steps before the epsilon decays to the minimum")
     parser.add_argument("--epsilon_min", type=float, default=0.05, help="Minimum epsilon")
@@ -123,7 +195,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_rnn", type=bool, default=True, help="Whether to use RNN")
     parser.add_argument("--use_orthogonal_init", type=bool, default=True, help="Orthogonal initialization")
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
-    parser.add_argument("--use_lr_decay", type=bool, default=False, help="use lr decay")
+    parser.add_argument("--use_lr_decay", type=bool, default=True, help="use lr decay")
     parser.add_argument("--use_RMS", type=bool, default=False, help="Whether to use RMS,if False, we will use Adam")
     parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
     parser.add_argument("--add_agent_id", type=bool, default=True, help="Whether to add agent id into the observation")
@@ -136,6 +208,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
 
+    # check if cuda available
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # args.device = torch.device("mps")
 
-    env = StarCraft2Env(map_name = '8m')
-    decentralized_runner(args, env)
+    env_names = ['3m', '8m', '2s3z']
+    env_index = 0
+    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id=1, seed=0)
+    runner.run()
+        

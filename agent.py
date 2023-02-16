@@ -1,21 +1,23 @@
-from buffer import ReplayBuffer
-from network import Q_network_MLP, Q_network_RNN
 import torch
+from network import Q_network_RNN, Q_network_MLP
+from buffer import ReplayBuffer
 import numpy as np
 
-class AgentBase(object):
-    def __init__(self, args) -> None:
-        self.N = 1
+
+class VDN_Agent(object):
+    def __init__(self, args, id, seed):
+        args.id = id
+        self.id = id
+        self.n_agents = args.n_agents
         self.action_dim = args.action_dim
         self.obs_dim = args.obs_dim
-        self.state_dim = args.state_dim
         self.add_last_action = args.add_last_action
         self.add_agent_id = args.add_agent_id
         self.max_train_steps=args.max_train_steps
         self.lr = args.lr
         self.gamma = args.gamma
         self.use_grad_clip = args.use_grad_clip
-        self.batch_size = args.batch_size  # 这里的batch_size代表有多少个episode
+        self.batch_size = args.batch_size  
         self.target_update_freq = args.target_update_freq
         self.tau = args.tau
         self.use_hard_update = args.use_hard_update
@@ -24,137 +26,158 @@ class AgentBase(object):
         self.use_double_q = args.use_double_q
         self.use_RMS = args.use_RMS
         self.use_lr_decay = args.use_lr_decay
-        self.use_history_encoding = args.use_history_encoding
-
-        self.current_action = 0
-        self.last_action = 0
-        self.last_obs = np.zeros(self.obs_dim)
-        self.last_q_value = 0
-
-        self.replay_buffer = ReplayBuffer(args.buffer_size, args.batch_size, self.obs_dim, self.action_dim)
-
+        self.seed = seed
+        self.device = args.device
+        self.replay_buffer = ReplayBuffer(args)
 
         self.input_dim = self.obs_dim
         if self.add_last_action:
-            print("------add last action------")
             self.input_dim += self.action_dim
-            self.last_onehot_a = np.zeros(self.action_dim)
-        
-        if self.use_rnn:
-            print("------use RNN------")
-            self.eval_Q_net = Q_network_RNN(args, self.input_dim)
-            self.target_Q_net = Q_network_RNN(args, self.input_dim)
-        else:
-            print("------use MLP------")
-            self.eval_Q_net = Q_network_MLP(args, self.input_dim)
-            self.target_Q_net = Q_network_MLP(args, self.input_dim)
-        self.target_Q_net.load_state_dict(self.eval_Q_net.state_dict())
 
-        self.eval_parameters = list(self.eval_Q_net.parameters())
-        if self.use_RMS:
-            print("------optimizer: RMSprop------")
-            self.optimizer = torch.optim.RMSprop(self.eval_parameters, lr=self.lr)
+        if self.use_rnn:
+            self.q_network = Q_network_RNN(args, self.input_dim)
+            self.target_q_network = Q_network_RNN(args, self.input_dim)
+
         else:
-            print("------optimizer: Adam------")
-            self.optimizer = torch.optim.Adam(self.eval_parameters, lr=self.lr)
-        
+            self.q_network = Q_network_MLP(args, self.input_dim)
+            self.target_q_network = Q_network_MLP(args, self.input_dim)
+
+        self.target_q_network.load_state_dict(self.q_network.state_dict())
+
+        self.q_network.to(self.device)
+        self.target_q_network.to(self.device)
+
+        self.eval_parameters = list(self.q_network.parameters())
+        if self.use_RMS:
+            self.optimizer = torch.optim.RMSprop(self.q_network.parameters(), lr=self.lr)
+        else:
+            self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.lr)
+
         self.train_step = 0
 
-    def receive_observation(self, obs):
-        self.current_obs = obs
-        self.last_action = self.current_action
-
-    def receive_next_observation(self, obs):
-        self.last_obs = self.current_obs
-        self.current_obs = obs
-
-    def receive_reward(self, reward):
-        self.current_reward = reward
-    
-    def receive_terminated(self, terminated):
-        self.current_terminated = terminated
-    
-    """get q values of all actions"""
-    def get_q_values(self, obs, avail_a, last_onehot_a = None):
+    def choose_action(self, local_obs, last_onehot_a, avail_a, epsilon):
         with torch.no_grad():
-            inputs = []
-            obs = torch.tensor(obs, dtype = torch.float32)
-            inputs.append(obs)
-            if self.add_last_action:
-                if last_onehot_a is None:
-                    last_onehot_a = torch.functional.one_hot(torch.tensor(self.last_action), self.action_dim)
-                inputs.append(last_onehot_a)
+            if np.random.uniform() < epsilon:
+                return np.random.choice(np.nonzero(avail_a)[0])
+            else:
+                inputs = []
+                obs = torch.tensor(local_obs, dtype=torch.float32, device=self.device)
+                inputs.append(obs)
+                if self.add_last_action:
+                    last_a = torch.tensor(last_onehot_a, dtype=torch.float32, device=self.device)
+                    inputs.append(last_a)
+                
+                # concatenate all inputs
+                inputs = torch.cat(inputs, dim=0)
+                q_values = self.q_network(inputs)
+                avail_a = torch.tensor(avail_a, dtype=torch.float32, device="cpu")
+                q_values[avail_a == 0.0] = -float('inf')
+                a = torch.max(q_values, dim=0)[1].item()
+            return a
 
-            inputs = torch.cat([x for x in inputs], dim = -1) #originally the input.shape = (N,inputs_dim)
-            q_value = self.eval_Q_net(inputs)
 
-            avail_a = torch.tensor(avail_a, dtype = torch.float32)
-            q_value[avail_a == 0] = -float('inf')
-        
-        return q_value.numpy()
+    def peer2peer_messaging(self, seed, mode, sender_id = None, sender_message = None):
+        if '0' in mode:
+            self.batch, self.max_episode_len = self.replay_buffer.sample(seed)
+            self.inputs = self.get_inputs(self.batch).clone().detach() # dimension: batch_size * max_episode_len * input_dim
+            #self.message_to_send = empty tensor with shape (batch_size, max_episode_len, n_agents)
+            self.message_to_send = torch.zeros((self.batch_size, self.max_episode_len, self.n_agents), device=self.device, dtype=torch.float32)
+            self.message_to_rece = torch.zeros((self.batch_size, self.max_episode_len, self.n_agents), device=self.device, dtype=torch.float32)
+            self.train_step += 1
+            if self.use_rnn:
+                self.q_network.rnn_hidden = None
+                self.target_q_network.rnn_hidden = None
+        elif '1' in mode:
+            if self.use_rnn:
+                self.q_evals, self.q_targets = [], []
+                for t in range(self.max_episode_len):  # t=0,1,2,...(episode_len-1)
+                    self.q_eval = self.q_network(self.inputs[:, t].reshape(-1, self.input_dim))  # q_eval.shape=(batch_size,action_dim)
+                    self.q_target = self.target_q_network(self.inputs[:, t + 1].reshape(-1, self.input_dim))
+                    self.q_evals.append(self.q_eval.reshape(self.batch_size, -1))  # q_eval.shape=(batch_size,action_dim)
+                    self.q_targets.append(self.q_target.reshape(self.batch_size, -1))
 
+                # Stack them according to the time (dim=1)
+                self.q_evals = torch.stack(self.q_evals, dim=1)  # q_evals.shape=(batch_size,max_episode_len,action_dim)
+                self.q_targets = torch.stack(self.q_targets, dim=1)
+            else:
+                self.q_evals = self.q_network(self.inputs[:, :-1])  # q_evals.shape=(batch_size,max_episode_len,action_dim)
+                self.q_targets = self.target_q_network(self.inputs[:, 1:])
 
-    """choose action according to epsilon-greedy policy"""
-    def choose_action(self, obs, avail_a, epsilon, last_onehot_a = None):    
+            with torch.no_grad():
+                if self.use_double_q:  # If use double q-learning, we use eval_net to choose actions,and use target_net to compute q_target
+                    q_eval_last = self.q_network(self.inputs[:, -1].reshape(-1, self.input_dim)).reshape(self.batch_size, 1, -1)
+                    q_evals_next = torch.cat([self.q_evals[:, 1:], q_eval_last], dim=1) # q_evals_next.shape=(batch_size,max_episode_len,action_dim)
+                    q_evals_next[self.batch['avail_a'][:, 1:] == 0] = -999999
+                    a_argmax = torch.argmax(q_evals_next, dim=-1, keepdim=True)  # a_max.shape=(batch_size,max_episode_len, 1)
+                    self.q_targets = torch.gather(self.q_targets, dim=-1, index=a_argmax).squeeze(-1)  # q_targets.shape=(batch_size, max_episode_len)
+                else:
+                    self.q_targets[self.batch['avail_a'][:, 1:] == 0] = -999999
+                    self.q_targets = self.q_targets.max(dim=-1)[0]  # q_targets.shape=(batch_size, max_episode_len)
 
-        if np.random.uniform() < epsilon:
-            a = np.random.choice(np.nonzero(avail_a)[0])
-            q_value = self.get_q_values(obs, avail_a, last_onehot_a)[a]
-            self.current_action = a
-            self.last_q_value = q_value
-            return a, q_value
-        else:
-            self.last_q_value = self.get_q_values(obs, avail_a, last_onehot_a)
-            a, q_value = self.last_q_value.argmax(axis = -1), self.last_q_value.max(axis = -1)
-            self.last_q_value = q_value
-            self.current_action = a   
-            return a, q_value
-
-    """store transition in replay buffer"""
-    def update_buffer(self, transition_id):
-        transition = [transition_id, (self.last_obs, self.last_action), self.current_reward, self.current_terminated, (self.current_obs, self.current_action)]
-        self.replay_buffer.store(transition)
+            
+            self.q_evals = torch.gather(self.q_evals, dim=-1, index=self.batch['a'].unsqueeze(-1)).squeeze(-1)  # q_evals.shape(batch_size, max_episode_len)
+            # make n_agent copies of q_evals and q_targets each of which multiplied by 1/n_agents
+            with torch.no_grad():
+                self.secret = self.q_evals - ((1.0/self.n_agents) * self.batch['r'].squeeze(-1) + self.gamma * (1-self.batch['dw'].squeeze(-1)) * self.q_targets)
+                self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents # q_evals.shape=(batch_size, max_episode_len, n_agents, n_agents)
     
-    """Update the target network"""
-    def update_target_net(self):
+
+        elif '2' in mode:
+            self.message_to_rece[:,:,sender_id] = sender_message
+
+        elif '3' in mode:
+            self.sum_shares = torch.sum(self.message_to_rece, dim=2)  # sum_q_vals.shape=(batch_size, max_episode_len)
+            return self.sum_shares
+
+            
+            
+
+    def train(self, total_steps, sum_shares):
+        td_error = sum_shares - self.q_evals.detach()
+        td_error += self.q_evals
+        mask_td_error = td_error * self.batch['active'].squeeze(-1)
+
+        loss = (mask_td_error ** 2).sum() / self.batch['active'].sum()
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.use_grad_clip:
+            torch.nn.utils.clip_grad_norm_(self.eval_parameters, 10)
+        self.optimizer.step()
+
         if self.use_hard_update:
-            self.target_Q_net.load_state_dict(self.eval_Q_net.state_dict())
+            # hard update
+            if self.train_step % self.target_update_freq == 0:
+                self.target_q_network.load_state_dict(self.q_network.state_dict())
         else:
-            for eval_param, target_param in zip(self.eval_Q_net.parameters(), self.target_Q_net.parameters()):
-                target_param.data.copy_(self.tau * eval_param.data + (1 - self.tau) * target_param.data)
+            # Softly update the target networks
+            for param, target_param in zip(self.q_network.parameters(), self.target_q_network.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
 
+        if self.use_lr_decay:
+            self.lr_decay(total_steps)
 
-
-    
-
-
-class AgentVDN(AgentBase):
-    def __init__(self) -> None:
-        super(AgentVDN, self).__init__()
-
-    def send_message(self, minibatch, method):
-        raise NotImplementedError
-
-    def receive_message(self, method):
-        raise NotImplementedError
-
-    def update(self):
-        raise NotImplementedError
-
-class AgentQMIX(AgentBase):
-    def __init__(self) -> None:
-        super(AgentQMIX, self).__init__()
-
-    def send_message(self, minibatch, method):
-        raise NotImplementedError
-
-    def receive_message(self, method):
-        raise NotImplementedError
-
-    def update(self):
-        raise NotImplementedError
-
+    def lr_decay(self, total_steps):  # Learning rate Decay
+        lr_now = self.lr * (1 - total_steps / self.max_train_steps)
+        for p in self.optimizer.param_groups:
+            p['lr'] = lr_now
 
 
     
+    def get_inputs(self, batch):
+        inputs = []
+        obs = batch['obs'].clone().detach()
+        inputs.append(obs)
+        if self.add_last_action:
+            last_a = batch['last_onehot_a'].clone().detach()
+            inputs.append(last_a)
+        inputs = torch.cat(inputs, dim=2)
+        return inputs
+
+
+
+            
+                    
+                    
+        
+        
