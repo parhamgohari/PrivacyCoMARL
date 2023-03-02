@@ -11,6 +11,7 @@ def orthogonal_init(layer, gain = 1.0):
             nn.init.constant_(param, 0.0)
         else:
             raise NotImplementedError
+        
     
 class Q_network_RNN(nn.Module):
     def __init__(self, args, input_dim):
@@ -21,6 +22,7 @@ class Q_network_RNN(nn.Module):
         self.fc1 = nn.Linear(input_dim, args.rnn_hidden_dim)
         self.rnn = nn.GRUCell(args.rnn_hidden_dim, args.rnn_hidden_dim)
         self.fc2 = nn.Linear(args.rnn_hidden_dim, args.action_dim)
+
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
             orthogonal_init(self.rnn)
@@ -35,6 +37,7 @@ class Q_network_RNN(nn.Module):
         self.rnn_hidden = self.rnn(x, self.rnn_hidden)
         Q = self.fc2(self.rnn_hidden)
         return Q
+    
         
         
 class Q_network_MLP(nn.Module):
