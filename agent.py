@@ -6,11 +6,10 @@ from opacus import GradSampleModule
 from opacus.privacy_engine import forbid_accumulation_hook
 from opacus.optimizers import DPOptimizer
 from opacus.accountants import RDPAccountant
-from torchcontrib.optim import SWA
 
 BASE = 10
-PRECISION = 10
-PRIME =121639451781281043402593 
+PRECISION = 5
+Q =2**31-1 
 
     
 
@@ -48,7 +47,9 @@ class VDN_Agent(object):
         self.l2_norm_clip_decay = args.l2_norm_clip_decay
         self.l2_norm_clip_min = args.l2_norm_clip_min
         self.noise_multiplier = args.noise_multiplier
-
+        
+        self.use_mpc = args.use_mpc
+        self.load_from_saved_model = args.load_from_saved_model
         
 
 
@@ -73,10 +74,9 @@ class VDN_Agent(object):
         if self.use_RMS:
             self.optimizer = torch.optim.RMSprop(self.q_network.parameters(), lr=self.lr)
         else:
-            # self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.lr)
-            self.optimizer = torch.optim.SGD(self.q_network.parameters(), lr=self.lr, momentum=0.9, weight_decay=0.0001)
-        # if args.use_swa:
-        #     self.optimizer_swa = SWA(self.optimizer, swa_start=0, swa_freq=5, swa_lr=1e-5)
+            # self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.lr, weight_decay=0.001)
+            self.optimizer = torch.optim.SGD(self.q_network.parameters(), lr=self.lr, momentum=0.7 if self.load_from_saved_model else 0.9, weight_decay= 0.0001)
+
 
         
         if args.use_dp:
@@ -99,7 +99,7 @@ class VDN_Agent(object):
         
         self.base = BASE
         self.precision = PRECISION
-        self.prime = PRIME
+        self.Q = Q
 
 
         self.train_step = 0
@@ -124,30 +124,35 @@ class VDN_Agent(object):
                 
                 # concatenate all inputs
                 inputs = torch.cat(inputs, dim=0)
-                q_values = self.target_q_network(inputs)
+                q_values = self.q_network(inputs)
                 avail_a = torch.tensor(avail_a, dtype=torch.float32, device=self.device)
                 q_values[avail_a == 0.0] = -float('inf')
                 a = torch.max(q_values, dim=0)[1].item()
             return a
         
-
+    # Fixed point encoding
     def encoder(self, x):
-        encoding = torch.tensor(self.base**self.precision * x, dtype=torch.int64, device=self.device) % self.prime
+        encoding = (self.base**self.precision * x % self.Q).clone().detach().int()
         return encoding
 
+    # Fixed point decoding
     def decoder(self, x):
-        x = torch.tensor(x, dtype=torch.float32, device=self.device) 
-        decoding = x.clone().detach() 
-        decoding[x > self.prime/2] = x[x > self.prime/2] - self.prime
-        return decoding / self.base**self.precision
+        x[x > self.Q/2] = x[x > self.Q/2] - self.Q
+        return x / self.base**self.precision
     
-    def generate_additive_shares(self, x):
+    # Additive secret sharing
+    def encrypt(self, x):
         shares = []
         for i in range(self.n_agents-1): 
-            shares.append(torch.randint(0, self.prime, x.shape, device=self.device))
-        shares.append((self.prime - torch.sum(torch.stack(shares), dim=0)) % self.prime)
+            shares.append(torch.randint(0, self.Q, x.shape, device=self.device))
+        shares.append(self.Q - sum(shares) % self.Q + self.encoder(x))
         shares = torch.stack(shares, dim=0)
+        # swap the first dimension with the last dimension
+        shares = shares.permute(1, 2, 0)
         return shares
+    
+    def decrypt(self, shares):
+        return self.decoder(torch.sum(shares, dim=2) % self.Q)
 
     
 
@@ -200,9 +205,10 @@ class VDN_Agent(object):
             # make n_agent copies of q_evals and q_targets each of which multiplied by 1/n_agents
             with torch.no_grad():
                 self.secret = self.q_evals - ((1.0/self.n_agents) * self.batch['r'].squeeze(-1) + self.gamma * (1-self.batch['dw'].squeeze(-1)) * self.q_targets)
-                #self.secret_shares = empty tensor with shape (self.current_batch_size, self.max_episode_len, n_agents)
-                self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents # q_evals.shape=(batch_size, max_episode_len, n_agents, n_agents)
-    
+                if self.use_mpc:
+                    self.secret_shares = self.encrypt(self.secret)
+                else:
+                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents
 
         elif '2' in mode and not self.skip:
             self.message_to_rece[:,:,sender_id] = sender_message
@@ -221,23 +227,16 @@ class VDN_Agent(object):
 
         loss = (mask_td_error ** 2).sum() / self.batch['active'].sum()
 
-        # if self.use_swa:
-        #     self.optimizer_swa.zero_grad()
-        #     loss.backward()
-        #     self.optimizer_swa.step()
-        
-        # else:
         self.optimizer.zero_grad()
         loss.backward()
-        # print the l2_norm of the gradient
         
-        temp = []
-        for name, param in self.q_network.named_parameters():
-            if param.requires_grad:
-                temp.append(param.grad.data.norm(2))
-        max_grad_norm = max(temp)
-        if max_grad_norm >= 1:
-            print("max_grad_norm: ", max_grad_norm)
+        # temp = []
+        # for name, param in self.q_network.named_parameters():
+        #     if param.requires_grad:
+        #         temp.append(param.grad.data.norm(2))
+        # max_grad_norm = max(temp)
+        # if max_grad_norm >= 1:
+        #     print("max_grad_norm: ", max_grad_norm)
 
         if self.use_grad_clip:
             torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), self.l2_norm_clip)
@@ -283,6 +282,14 @@ class VDN_Agent(object):
             inputs.append(last_a)
         inputs = torch.cat(inputs, dim=2)
         return inputs
+    
+    def save_network(self, path):
+        torch.save(self.q_network.state_dict(), path + '.pth')
+        torch.save(self.target_q_network.state_dict(), path + '_target.pth')
+
+    def load_network(self, path):
+        self.q_network.load_state_dict(torch.load(path + '.pth'))
+        self.target_q_network.load_state_dict(torch.load(path + '_target.pth'))
 
 
 

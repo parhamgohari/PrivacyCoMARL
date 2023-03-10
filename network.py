@@ -17,7 +17,7 @@ class Q_network_RNN(nn.Module):
     def __init__(self, args, input_dim):
         super(Q_network_RNN, self).__init__()
         self.args = args
-        self.init_hidden()
+        self.rnn_hidden = None
 
         self.fc1 = nn.Linear(input_dim, args.rnn_hidden_dim)
         self.rnn = nn.GRUCell(args.rnn_hidden_dim, args.rnn_hidden_dim)
@@ -27,9 +27,6 @@ class Q_network_RNN(nn.Module):
             orthogonal_init(self.fc1)
             orthogonal_init(self.rnn)
             orthogonal_init(self.fc2)
-
-    def init_hidden(self): 
-        self.rnn_hidden = None
         
 
     def forward(self, inputs):
