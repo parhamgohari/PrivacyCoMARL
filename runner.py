@@ -116,42 +116,42 @@ class VDN_Runner(object):
 
 
 
-            for _ in range(self.args.buffer_throughput):
-                _, _, episode_steps = self.run_episode_smac(evaluate = False)
-                self.total_steps += episode_steps
-                pbar.update(episode_steps)
+            _, _, episode_steps = self.run_episode_smac(evaluate = False)
+            self.total_steps += episode_steps
+            pbar.update(episode_steps)
 
 
             if self.args.use_dp:
-                skip = [] 
-                for agent in self.agents:
-                    skip.append(agent.peer2peer_messaging(self.seed, mode = '0. initiate'))
-                if True not in skip:
+                if torch.rand(1) < 1.0/self.args.buffer_throughput:
+                    skip = [] 
                     for agent in self.agents:
-                        agent.peer2peer_messaging(self.seed, mode = '1. compute message')
-                    local_sums = []
-                    for receiver_agent in self.agents:
-                        for sender_agent in self.agents:
-                            receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                        local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
-                    
-                    local_sums = torch.stack(local_sums)
-                    if self.args.use_mpc:
+                        skip.append(agent.peer2peer_messaging(self.seed, mode = '0. initiate'))
+                    if True not in skip:
                         for agent in self.agents:
-                            agent.train(self.total_steps, agent.decrypt(local_sums.permute(1, 2, 0)))
-                        _, self.seed = self.branch_seed(self.seed)
-                    else:
-                        sum_shares = torch.sum(local_sums, dim = 0)
-                                
-                        for agent in self.agents:
-                            agent.train(self.total_steps, sum_shares)
-                        _, self.seed = self.branch_seed(self.seed)
+                            agent.peer2peer_messaging(self.seed, mode = '1. compute message')
+                        local_sums = []
+                        for receiver_agent in self.agents:
+                            for sender_agent in self.agents:
+                                receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                            local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
+                        
+                        local_sums = torch.stack(local_sums)
+                        if self.args.use_mpc:
+                            for agent in self.agents:
+                                agent.train(self.total_steps, agent.decrypt(local_sums.permute(1, 2, 0)))
+                            _, self.seed = self.branch_seed(self.seed)
+                        else:
+                            sum_shares = torch.sum(local_sums, dim = 0)
+                                    
+                            for agent in self.agents:
+                                agent.train(self.total_steps, sum_shares)
+                            _, self.seed = self.branch_seed(self.seed)
 
-                if min([agent.replay_buffer.number_of_appends for agent in self.agents]) <= self.args.buffer_size/self.args.buffer_throughput:
-                    self.privacy_budget = {
-                        'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]),
-                        'delta': self.args.delta
-                    }
+                    if min([agent.replay_buffer.number_of_appends for agent in self.agents]) <= self.args.buffer_size:
+                        self.privacy_budget = {
+                            'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) * 1.0/self.args.buffer_throughput,
+                            'delta': self.args.delta * 1.0/self.args.buffer_throughput
+                        }
                 
             else:
                 if min([agent.replay_buffer.current_size for agent in self.agents]) >= self.args.batch_size:
@@ -325,8 +325,8 @@ if __name__ == '__main__':
     parser.add_argument("--use_hard_update", type=bool, default=True, help="Whether to use hard update")
     parser.add_argument("--target_update_freq", type=int, default=200, help="Update frequency of the target network")
     parser.add_argument("--tau", type=int, default=0.005, help="If use soft update")
-    parser.add_argument("--noise_multiplier", type=float, default=1, help="Noise multiplier for DPSGD")
-    parser.add_argument("--buffer_throughput", type=int, default=1, help="Buffer throughput to enhance privacy budget")
+    parser.add_argument("--noise_multiplier", type=float, default=0.8, help="Noise multiplier for DPSGD")
+    parser.add_argument("--buffer_throughput", type=int, default=1.5, help="Buffer throughput to enhance privacy budget")
     parser.add_argument("--use_mpc", type=bool, default=True, help="If use MPC")
     parser.add_argument("--load_from_saved_model", type=bool, default=False, help="If load from saved model")
     # parser.add_argument("--delta", type=float, default=5e-7, help="delta DPSGD")
@@ -334,7 +334,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
     args.l2_norm_clip_decay = (args.l2_norm_clip - args.l2_norm_clip_min) / args.l2_norm_clip_decay_steps
-    args.delta = 1.0/(args.buffer_size ** 1.1)
+    args.delta = 1.0/(args.buffer_size ** 1.1) * args.buffer_throughput
 
     args.evaluate_freq = args.evaluate_freq * args.buffer_throughput
     args.epsilon_decay_steps = args.epsilon_decay_steps * args.buffer_throughput
