@@ -5,9 +5,7 @@ import argparse
 from agent import VDN_Agent
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import datetime
-import os
-import json
+import time
 
 
 
@@ -19,7 +17,6 @@ class VDN_Runner(object):
         self.device = args.device
         self.seed = seed
         self.privacy_mechanism = privacy_mechanism
-        self.env_name = env_name
         self.env = StarCraft2Env(map_name=env_name, seed = self.seed)
         self.env_info = self.env.get_env_info()
         self.args.n_agents = self.env_info["n_agents"]
@@ -33,21 +30,23 @@ class VDN_Runner(object):
         print("episode_limit={}".format(self.args.episode_limit))
         self.epsilon = self.args.epsilon
 
+        if args.use_dp:
+            self.privacy_budget = {
+                'epsilon': 0,
+                'delta': 0,
+            }
+
+        if args.use_anchoring:
+            self.anchor_threshold = 0.5
+
         _, self.seed = self.branch_seed(self.seed)
         # create n_agents VDN agents
         self.agents = [VDN_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
 
-        if args.load_from_saved_model:
-            for agent in self.agents:
-                agent.load_network('model')
         # creat a tensorboard
-        if not os.path.exists("./log/{}".format(exp_id)):
-            os.makedirs("./log/{}".format(exp_id))
-        self.writer = SummaryWriter(log_dir="./log/{}".format(exp_id))
+        self.writer = SummaryWriter(log_dir="./log/{}_{}_{}".format(self.args.algorithm, env_name, exp_id))
 
         self.win_rates = []
-        self.evaluate_rewards = []
-        self.best_win_rate = 0
         self.total_steps = 0
 
     def branch_seed(self, current_seed, number_of_branches = 1):
@@ -59,164 +58,96 @@ class VDN_Runner(object):
         return random_seeds[:-1], random_seeds[-1]
 
     def run(self):
-        evaluate_num = 0
+        evaluate_num = -1
         pbar = tqdm(total = self.total_steps)
-        first_adjustment_done = False
-        second_adjustment_done = False
-
-        if self.args.use_dp:
-            self.privacy_budget = {
-                        'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]),
-                        'delta': self.args.delta
-                    }
+        dp_measured = False
         while self.total_steps < self.args.max_train_steps:
             if self.total_steps // self.args.evaluate_freq > evaluate_num:
                 self.evaluate_policy()
+                if self.args.use_anchoring:
+                    self.evaluate_policy(use_anchor_q = True)
                 evaluate_num += 1
-
-                """Piecewise learning rate adjustment"""
-                if self.win_rates[-1] > 0.4 and not first_adjustment_done:
-                    for agent in self.agents:
-                        agent.save_network('first_checkpoint_model_{}_{}'.format(agent.id, self.exp_id))
-                    print('Saved agent models')
-                    first_adjustment_done = True
-                    self.args.lr = 1e-4
-                    self.args.epsilon = 0.1
-                    self.args.epsilon_min = 0.01
-                    self.args.epsilon_decay = (self.args.epsilon - self.args.epsilon_min) / self.args.epsilon_decay_steps
-                    self.args.max_train_steps += 5e5
-                    self.args.l2_norm_clip = 1
-                    self.args.load_from_saved_model = True
-                    self.agents = [VDN_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
-                    for agent in self.agents:
-                        agent.load_network('first_checkpoint_model_{}_{}'.format(agent.id, self.exp_id))
-                    print('Learning rate lowered to 1e-4')
-                
-                if self.win_rates[-1] > 0.8 and first_adjustment_done and not second_adjustment_done:
-                    for agent in self.agents:
-                        agent.save_network('second_checkpoint_model_{}_{}'.format(agent.id, self.exp_id))
-                    print('Saved agent models')
-                    second_adjustment_done = True
-                    self.args.lr = 1e-5
-                    self.args.max_train_steps += 5e5
-                    self.args.l2_norm_clip = 1
-                    self.args.load_from_saved_model = True
-                    self.agents = [VDN_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
-                    for agent in self.agents:
-                        agent.load_network('second_checkpoint_model_{}_{}'.format(agent.id, self.exp_id))
-                    print('Learning rate lowered to 1e-5')
-                    self.best_win_rate = self.win_rates[-1]
-                
-                if second_adjustment_done:
-                    if self.win_rates[-1] > self.best_win_rate:
-                        for agent in self.agents:
-                            agent.save_network('best_model_{}_{}'.format(agent.id, self.exp_id))
-                        print('Saved agent models')
-                        self.best_win_rate = self.win_rates[-1]
-
-
 
             _, _, episode_steps = self.run_episode_smac(evaluate = False)
             self.total_steps += episode_steps
             pbar.update(episode_steps)
 
+            if self.args.use_anchoring:
+                if self.win_rates[-1] > self.anchor_threshold:
+                    for agent in self.agents:
+                        agent.anchor_q_network.load_state_dict(agent.q_network.state_dict())
+                        agent.anchoring_weight += 1e-2
+                    self.anchor_threshold *= 1.3
+
+            
+            # start training if all agent replay buffer has enough samples
+            if min([agent.replay_buffer.current_size for agent in self.agents]) >= self.args.batch_size:
+                #create an np array of size batch_size * n_agents (sender) * n_agents (receiver)
+                skip_iteration = False
+                for agent in self.agents:
+                    agent.peer2peer_messaging(self.seed, mode = '0. initiate')
+                    if agent.empty_batch:
+                        skip_iteration = True
+                        break
+                if skip_iteration:
+                    continue
+                for agent in self.agents:
+                    agent.peer2peer_messaging(self.seed, mode = '1. compute message')
+                local_sums = []
+                for receiver_agent in self.agents:
+                    for sender_agent in self.agents:
+                        receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
+                local_sums = torch.stack(local_sums)
+                
+                if not self.args.use_secret_sharing:
+                    sum_shares = torch.sum(local_sums, dim = 0)
+                        
+                for agent in self.agents:
+                    if self.args.use_secret_sharing:
+                        agent.train(self.total_steps, agent.decrypt(local_sums))
+                    else:
+                        agent.train(self.total_steps, sum_shares)
+                _, self.seed = self.branch_seed(self.seed)
 
             if self.args.use_dp:
-                if torch.rand(1) < 1.0/self.args.buffer_throughput:
-                    skip = [] 
-                    for agent in self.agents:
-                        skip.append(agent.peer2peer_messaging(self.seed, mode = '0. initiate'))
-                    if True not in skip:
-                        for agent in self.agents:
-                            agent.peer2peer_messaging(self.seed, mode = '1. compute message')
-                        local_sums = []
-                        for receiver_agent in self.agents:
-                            for sender_agent in self.agents:
-                                receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                            local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
-                        
-                        local_sums = torch.stack(local_sums)
-                        if self.args.use_mpc:
-                            for agent in self.agents:
-                                agent.train(self.total_steps, agent.decrypt(local_sums.permute(1, 2, 0)))
-                            _, self.seed = self.branch_seed(self.seed)
-                        else:
-                            sum_shares = torch.sum(local_sums, dim = 0)
-                                    
-                            for agent in self.agents:
-                                agent.train(self.total_steps, sum_shares)
-                            _, self.seed = self.branch_seed(self.seed)
-
-                    if min([agent.replay_buffer.number_of_appends for agent in self.agents]) <= self.args.buffer_size:
-                        self.privacy_budget = {
-                            'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) * 1.0/self.args.buffer_throughput,
-                            'delta': self.args.delta * 1.0/self.args.buffer_throughput
-                        }
+                if min([agent.replay_buffer.current_size for agent in self.agents]) == self.args.buffer_size and not dp_measured:
+                    self.privacy_budget = {
+                        'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) /self.args.buffer_throughput,
+                        'delta': self.args.delta /self.args.buffer_throughput
+                    }
+                    dp_measured = True
                 
-            else:
-                if min([agent.replay_buffer.current_size for agent in self.agents]) >= self.args.batch_size:
-                    for agent in self.agents:
-                        agent.peer2peer_messaging(self.seed, mode = '0. initiate')
-                    for agent in self.agents:
-                        agent.peer2peer_messaging(self.seed, mode = '1. compute message')
-                    local_sums = []
-                    for receiver_agent in self.agents:
-                        for sender_agent in self.agents:
-                            receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                        local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
-                    local_sums = torch.stack(local_sums)
-                    if self.args.use_mpc:
-                        for agent in self.agents:
-                            agent.train(self.total_steps, agent.decrypt(local_sums.permute(1, 2, 0)))
-                        _, self.seed = self.branch_seed(self.seed)
-                    else:
-                        sum_shares = torch.sum(local_sums, dim = 0)
-                                
-                        for agent in self.agents:
-                            agent.train(self.total_steps, sum_shares)
-                        _, self.seed = self.branch_seed(self.seed)
-
-            
-            
 
 
         self.evaluate_policy()
         self.env.close()
         pbar.close()
 
-
-
-
-            
-
-
-    def evaluate_policy(self):
-        win_times = torch.zeros(self.args.evaluate_times)
-        evaluate_reward = torch.zeros(self.args.evaluate_times)
-        for i in range(self.args.evaluate_times):
-            win_tag, episode_reward, _ = self.run_episode_smac(evaluate=True)
+    def evaluate_policy(self, use_anchor_q = False):
+        win_times = 0
+        evaluate_reward = 0
+        for _ in range(self.args.evaluate_times):
+            win_tag, episode_reward, _ = self.run_episode_smac(evaluate=True, use_anchor_q = use_anchor_q)
             if win_tag:
-                win_times[i] = 1
-            evaluate_reward[i] = episode_reward
-        win_rate = torch.mean(win_times)
-        win_std = torch.std(win_times)
-        evaluate_reward = torch.mean(evaluate_reward)
-        evaluate_std = torch.std(evaluate_reward)
-        self.win_rates.append(win_rate)
-        self.evaluate_rewards.append(evaluate_reward)
-        print("total_steps:{} \t win_rate:{} \t evaluate_reward:{}".format(self.total_steps, win_rate, evaluate_reward))
-        if self.args.use_dp:
-            print("privacy budget: {}, cycle: {}:{}".format(self.privacy_budget, self.agents[0].replay_buffer.number_of_appends // self.args.buffer_size, self.agents[0].replay_buffer.number_of_appends % self.args.buffer_size))
-        self.writer.add_scalar('win_rate_{}'.format(self.env_name), win_rate, global_step=self.total_steps)
-        self.writer.add_scalar('evaluate_reward_{}'.format(self.env_name), evaluate_reward, global_step=self.total_steps)
-        self.writer.add_scalar('win_std_{}'.format(self.env_name), win_std, global_step=self.total_steps)
-        self.writer.add_scalar('evaluate_reward_std_{}'.format(self.env_name), evaluate_std, global_step=self.total_steps)
-        # Save the win rates, evaluate rewards and their stds  
-        np.save('./data_train/{}.npy'.format(self.exp_id), np.array(self.win_rates))
-        np.save('./data_train/{}_reward.npy'.format(self.exp_id), np.array(self.evaluate_rewards))
-        
+                win_times += 1
+            evaluate_reward += episode_reward
 
-    def run_episode_smac(self, evaluate=False):
+        win_rate = win_times / self.args.evaluate_times
+        evaluate_reward = evaluate_reward / self.args.evaluate_times
+        if not use_anchor_q:
+            self.win_rates.append(win_rate)
+            print("total_steps:{} \t win_rate:{:.2f} \t evaluate_reward:{:.2f}".format(self.total_steps, win_rate, evaluate_reward))
+            self.writer.add_scalar('win_rate_{}'.format(self.env_name), win_rate, global_step=self.total_steps)
+        else:
+            print("total_steps:{} \t anchor_win_rate:{:.2f} \t anchor_evaluate_reward:{:.2f}".format(self.total_steps, win_rate, evaluate_reward))
+            self.writer.add_scalar('anchor_win_rate_{}'.format(self.env_name), win_rate, global_step=self.total_steps)
+        if self.args.use_dp:
+            print("privacy budget: epsilon={:.2f} and delta={:.5f}".format(self.privacy_budget['epsilon'], self.privacy_budget['delta']))
+        # Save the win rates
+        # np.save('./data_train/{}_env_{}_number_{}_seed_{}.npy'.format(self.args.algorithm, self.env_name, self.exp_id, self.seed), np.array(self.win_rates))
+
+    def run_episode_smac(self, evaluate=False, use_anchor_q=False):
         win_tag = False
         episode_reward = 0
         self.env.reset()
@@ -230,17 +161,19 @@ class VDN_Runner(object):
             joint_obs = self.env.get_obs()
             joint_avail_a = self.env.get_avail_actions()
             epsilon = 0 if evaluate else self.epsilon
-            joint_action = [agent.choose_action(joint_obs[agent.id], joint_last_onehot_a[agent.id], joint_avail_a[agent.id], epsilon) for agent in self.agents]
+            joint_action = [agent.choose_action(joint_obs[agent.id], joint_last_onehot_a[agent.id], joint_avail_a[agent.id], epsilon, use_anchor_q) for agent in self.agents]
             joint_last_onehot_a = np.eye(self.args.action_dim)[joint_action]
 
             try:
                 r, done, info = self.env.step(joint_action)
-            except ConnectionError:
-                print('ConnectionError')
-                self.env = StarCraft2Env(map_name=self.env_name, seed = self.seed)
+            except:
+                # pause for 30 seconds
+                time.sleep(30)
+                del self.env
+                from smac.env import StarCraft2Env
+                self.env = self.env = StarCraft2Env(map_name=self.env_name, seed = self.seed)
                 self.env.reset()
-                r, done, info = self.env.step(joint_action)
-
+                continue
             win_tag = True if done and 'battle_won' in info and info['battle_won'] else False
             episode_reward += r
 
@@ -296,67 +229,54 @@ class VDN_Runner(object):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hyperparameter Setting for QMIX and VDN in SMAC environment")
     parser.add_argument("--max_train_steps", type=int, default=int(5e5), help=" Maximum number of training steps")
-    parser.add_argument("--evaluate_freq", type=int, default=5000, help="Evaluate the policy every 'evaluate_freq' steps")
+    parser.add_argument("--evaluate_freq", type=float, default=5000, help="Evaluate the policy every 'evaluate_freq' steps")
     parser.add_argument("--evaluate_times", type=float, default=32, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
 
     parser.add_argument("--algorithm", type=str, default="VDN", help="QMIX or VDN")
-    parser.add_argument("--epsilon", type=float, default=1, help="Initial epsilon")
+    parser.add_argument("--epsilon", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon_decay_steps", type=float, default=50000, help="How many steps before the epsilon decays to the minimum")
-    parser.add_argument("--epsilon_min", type=float, default=0.1, help="Minimum epsilon")
-    parser.add_argument("--buffer_size", type=int, default=128, help="The capacity of the replay buffer")
+    parser.add_argument("--epsilon_min", type=float, default=0.05, help="Minimum epsilon")
+    parser.add_argument("--buffer_size", type=int, default=1024, help="The capacity of the replay buffer")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (the number of episodes)")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--rnn_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of RNN")
     parser.add_argument("--mlp_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of MLP")
     parser.add_argument("--use_rnn", type=bool, default=False, help="Whether to use RNN")
     parser.add_argument("--use_orthogonal_init", type=bool, default=True, help="Orthogonal initialization")
-    parser.add_argument("--use_grad_clip", type=bool, default=False, help="Gradient clip")
-    parser.add_argument("--l2_norm_clip", type=float, default=0.9, help="The norm of the gradient clip")
-    parser.add_argument("--use_l2_norm_clip_decay", type=bool, default=False, help="Whether to use l2 norm clip decay")
-    parser.add_argument("--l2_norm_clip_decay_steps", type=int, default=200000, help="How many steps before the l2 norm clip decays to the minimum")
-    parser.add_argument("--l2_norm_clip_min", type=float, default=0.2, help="Minimum l2 norm clip")
-    parser.add_argument("--use_lr_decay", type=bool, default=False, help="use lr decay")
+    parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="The norm of the gradient clip")
+    parser.add_argument("--use_lr_decay", type=bool, default=True, help="use lr decay")
     parser.add_argument("--use_RMS", type=bool, default=False, help="Whether to use RMS,if False, we will use Adam")
-    parser.add_argument("--use_dp", type=bool, default=True, help="Whether to use DP")
     parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
     parser.add_argument("--use_double_q", type=bool, default=True, help="Whether to use double q-learning")
     parser.add_argument("--use_hard_update", type=bool, default=True, help="Whether to use hard update")
     parser.add_argument("--target_update_freq", type=int, default=200, help="Update frequency of the target network")
     parser.add_argument("--tau", type=int, default=0.005, help="If use soft update")
-    parser.add_argument("--noise_multiplier", type=float, default=0.8, help="Noise multiplier for DPSGD")
-    parser.add_argument("--buffer_throughput", type=int, default=1.5, help="Buffer throughput to enhance privacy budget")
-    parser.add_argument("--use_mpc", type=bool, default=True, help="If use MPC")
-    parser.add_argument("--load_from_saved_model", type=bool, default=False, help="If load from saved model")
-    # parser.add_argument("--delta", type=float, default=5e-7, help="delta DPSGD")
+    parser.add_argument("--use_secret_sharing", type=bool, default=True, help="Whether to use secret sharing")
+    parser.add_argument("--use_poisson_sampling", type=bool, default=True, help="Whether to use poisson sampling")
+    parser.add_argument("--use_dp", type=bool, default=True, help="Whether to use differential privacy")
+    parser.add_argument("--noise_multiplier", type=float, default=0.8, help="Noise multiplier")
+    parser.add_argument("--delta", type=float, default=None, help="Delta")
+    parser.add_argument("--buffer_throughput", type=float, default=1.0, help="Buffer throughput")
+    parser.add_argument("--use_anchoring", type=bool, default=True, help="Whether to use anchoring")
+
 
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
-    args.l2_norm_clip_decay = (args.l2_norm_clip - args.l2_norm_clip_min) / args.l2_norm_clip_decay_steps
-    args.delta = 1.0/(args.buffer_size ** 1.1) * args.buffer_throughput
 
-    args.evaluate_freq = args.evaluate_freq * args.buffer_throughput
-    args.epsilon_decay_steps = args.epsilon_decay_steps * args.buffer_throughput
-    args.max_train_steps = args.max_train_steps * args.buffer_throughput
+    # check if cuda available
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # args.device = torch.device("mps")
 
+    if args.use_dp:
+        args.use_poison_sampling = True
+        args.use_grad_clip = True
+        args.delta = args.buffer_size**(-1.1) * args.buffer_throughput
 
     env_names = ['3m', '8m', '2s3z']
     env_index = 0
-    exp_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # save the hyperparameters into a json file
-    # create an empty args.json file
-    if not os.path.exists('log'):
-        os.makedirs('log')
-    if not os.path.exists(os.path.join('log', exp_id)):
-        os.makedirs(os.path.join('log', exp_id))
-    hyperparameters = args.__dict__
-    json_string = json.dumps(hyperparameters, indent=2)
-    with open(os.path.join('log', exp_id, 'args.json'), 'w') as f:
-        f.write(json_string)
-
-    args.device = torch.device("cpu")
-    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id= exp_id, seed=0)
-
+    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id=4021257, seed=0)
     runner.run()
         
