@@ -16,7 +16,7 @@ class Q_network_RNN(nn.Module):
     def __init__(self, args, input_dim):
         super(Q_network_RNN, self).__init__()
         self.args = args
-        self.rnn_hidden = torch.zeros(args.rnn_hidden_dim)
+        self.rnn_hidden = None
 
         self.fc1 = nn.Linear(input_dim, args.rnn_hidden_dim)
         self.rnn = nn.GRUCell(args.rnn_hidden_dim, args.rnn_hidden_dim)
@@ -50,50 +50,49 @@ class Q_network_MLP(nn.Module):
 
     def forward(self, inputs):
         x = F.relu(self.fc1(inputs))
-        x = F.relu(self.fc2(x))
-        Q = self.fc3(x)
+        self.hidden = F.relu(self.fc2(x))
+        Q = self.fc3(self.hidden)
         return Q
             
     
-class H_Q_network_MLP(nn.Module):
-    def __init__(self, args, input_dim) -> None:
-        super(H_Q_network_MLP, self).__init__()
-        self.args = args
-        self.input_dim = input_dim
-        self.fc1 = nn.Linear(input_dim , args.mlp_hidden_dim)
-        if args.use_orthogonal_init:
-            orthogonal_init(self.fc1)
 
-    def forward(self, inputs):
-        H = F.relu(self.fc1(inputs))
-        return H
     
-class H_V_network_MLP(nn.Module):
+class H_V_network(nn.Module):
     def __init__(self, args, input_dim) -> None:
-        super(H_V_network_MLP, self).__init__()
-        self.fc1 = nn.Linear(input_dim, args.mlp_hidden_dim)
+        super(H_V_network, self).__init__()
+        self.rnn_hidden = None
+        self.fc1 = nn.Linear(input_dim, args.rnn_hidden_dim)
+        self.rnn = nn.GRUCell(args.rnn_hidden_dim, args.rnn_hidden_dim)
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
+            orthogonal_init(self.rnn)
 
     def forward(self, inputs):
-        H = F.relu(self.fc1(inputs))
-        return H
+        x = F.relu(self.fc1(inputs))
+        self.rnn_hidden = self.rnn(x, self.rnn_hidden)
+
+        return self.rnn_hidden
 
 class Q_jt_network_MLP(nn.Module):
     def __init__(self, args, input_dim) -> None:
         super(Q_jt_network_MLP, self).__init__()
         self.args = args
         self.fc1 = nn.Linear(input_dim, args.mlp_hidden_dim)
-        self.fc2 = nn.Linear(args.mlp_hidden_dim, 1)
+        self.fc2 = nn.Linear(args.mlp_hidden_dim, args.mlp_hidden_dim)
+        self.fc3 = nn.Linear(args.mlp_hidden_dim, self.args.action_dim)
 
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
             orthogonal_init(self.fc2)
+            orthogonal_init(self.fc3)
 
     def forward(self, inputs):
         x = F.relu(self.fc1(inputs))
-        Q_jt = self.fc2(x)
+        x = F.relu(self.fc2(x))
+        Q_jt = self.fc3(x)
         return Q_jt
+
+
     
 class V_jt_network_MLP(nn.Module):
     def __init__(self, args, input_dim) -> None:
@@ -102,13 +101,17 @@ class V_jt_network_MLP(nn.Module):
         self.args = args
 
         self.fc1 = nn.Linear(input_dim, args.mlp_hidden_dim)
-        self.fc2 = nn.Linear(args.mlp_hidden_dim, 1)
+        self.fc2 = nn.Linear(args.mlp_hidden_dim, args.mlp_hidden_dim)
+        self.fc3 = nn.Linear(args.mlp_hidden_dim, 1)
 
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
             orthogonal_init(self.fc2)
+            orthogonal_init(self.fc3)
 
     def forward(self, inputs):
         x = F.relu(self.fc1(inputs))
-        V_jt = self.fc2(x)
+        x = F.relu(self.fc2(x))
+        V_jt = self.fc3(x)
         return V_jt
+    

@@ -61,6 +61,7 @@ class VDN_Runner(object):
         evaluate_num = -1
         pbar = tqdm(total = self.total_steps)
         dp_measured = False
+        episode_num = 0
         while self.total_steps < self.args.max_train_steps:
             if self.total_steps // self.args.evaluate_freq > evaluate_num:
                 self.evaluate_policy()
@@ -69,6 +70,7 @@ class VDN_Runner(object):
                 evaluate_num += 1
 
             _, _, episode_steps = self.run_episode_smac(evaluate = False)
+            episode_num += 1
             self.total_steps += episode_steps
             pbar.update(episode_steps)
 
@@ -86,116 +88,130 @@ class VDN_Runner(object):
                 #create an np array of size batch_size * n_agents (sender) * n_agents (receiver)
                 skip_iteration = False
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_Q_jt_dash(self.seed, mode = '0. initiate')
+                    agent.initiate_peer2peer_messaging(self.seed)
                     if agent.empty_batch:
                         skip_iteration = True
                         break
                 if skip_iteration:
                     continue
 
-                # Compute Q_jt_dash
+                # Compute q_jt_sum
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_Q_jt_dash(self.seed, mode = '1. compute message')
+                    agent.peer2peer_messaging_for_computing_q_jt_sum(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_Q_jt_dash(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_Q_jt_dash(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_q_jt_sum(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_q_jt_sum(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
-                if not self.args.use_secret_sharing:
-                    sum_shares = torch.sum(local_sums, dim = 0)
-
-                if self.args.use_secret_sharing:
-                    for agent in self.agents:
-                        agent.peer2peer_messaging_for_computing_Q_jt_dash(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
-                else:
-                    Q_jt_dash_bar = sum_shares
-                
-
-                # Compute Q_jt_dash_bar
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_Q_jt_dash_bar(self.seed, mode = '1. compute message')
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_q_jt_sum(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_q_jt_sum(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
+                # Compute q_jt_sum_opt
+                for agent in self.agents:
+                    agent.peer2peer_messaging_for_computing_q_jt_sum_opt(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_Q_jt_dash_bar(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_Q_jt_dash_bar(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_q_jt_sum_opt(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_q_jt_sum_opt(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
-                if not self.args.use_secret_sharing:
-                    sum_shares = torch.sum(local_sums, dim = 0)
-                
-                
-                if self.args.use_secret_sharing:
-                    for agent in self.agents:
-                        agent.peer2peer_messaging_for_computing_Q_jt_dash_bar(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
-                else:
-                    Q_jt_dash_bar_team = sum_shares
-
-
-                # Compute h_values
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_h_values(self.seed, mode = '1. compute message')
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_q_jt_sum_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_q_jt_sum_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
+
+                # Compute q_jt
+                for agent in self.agents:
+                    agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_h_values(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_h_values(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
-                if not self.args.use_secret_sharing:
-                    sum_shares = torch.sum(local_sums, dim = 0)
-
-                if self.args.use_secret_sharing:
-                    for agent in self.agents:
-                        agent.peer2peer_messaging_for_computing_h_values(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
-                else:
-                    h_values_team = sum_shares
-
-                # Compute h_values_bar
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_h_values_bar(self.seed, mode = '1. compute message')
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
+
+
+                # Compute q_jt_target
+                for agent in self.agents:
+                    agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_h_values_bar(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_h_values_bar(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
-                if not self.args.use_secret_sharing:
-                    sum_shares = torch.sum(local_sums, dim = 0)
-
-                if self.args.use_secret_sharing:
-                    for agent in self.agents:
-                        agent.peer2peer_messaging_for_computing_h_values_bar(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
-                else:
-                    h_values_team_bar = sum_shares
-
-                # Compute target_h_values_target
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_h_values_target(self.seed, mode = '1. compute message')
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
+                # Compute L_td
+                for agent in self.agents:
+                    agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_h_values_target(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_h_values_target(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
-                if not self.args.use_secret_sharing:
-                    sum_shares = torch.sum(local_sums, dim = 0)
+                for agent in self.agents:
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
 
-                if self.args.use_secret_sharing:
-                    for agent in self.agents:
-                        agent.peer2peer_messaging_for_computing_h_values_target(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
-                else:
-                    h_values_target_team_bar = sum_shares
+                # Compute L_opt
+                for agent in self.agents:
+                    agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '1. compute message')
+                local_sums = []
+                for receiver_agent in self.agents:
+                    for sender_agent in self.agents:
+                        receiver_agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '3. compute sum'))
+                local_sums = torch.stack(local_sums)
+
+                for agent in self.agents:
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
+                # Compute L_nopt_min
+                for agent in self.agents:
+                    agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '1. compute message')
+                local_sums = []
+                for receiver_agent in self.agents:
+                    for sender_agent in self.agents:
+                        receiver_agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '3. compute sum'))
+                local_sums = torch.stack(local_sums)
+
+                for agent in self.agents:
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
 
                 # train
                 for agent in self.agents:
-                    if not self.args.use_secret_sharing:
-                        agent.train(self.total_steps, Q_jt_dash_bar, Q_jt_dash_bar , h_values_team, h_values_team_bar, h_values_target_team_bar)
-                    
                     agent.train(self.total_steps)
 
                 
@@ -244,15 +260,11 @@ class VDN_Runner(object):
         for agent in self.agents:
             if self.args.use_rnn:
                 agent.q_network.rnn_hidden = None
-        joint_last_onehot_a = np.zeros((self.n_agents, self.args.action_dim))
 
         for episode_step in range(self.args.episode_limit):
             # get observations
-            joint_obs = self.env.get_obs()
-            joint_avail_a = self.env.get_avail_actions()
             epsilon = 0 if evaluate else self.epsilon
-            joint_action = [agent.choose_action(joint_obs[agent.id], joint_last_onehot_a[agent.id], joint_avail_a[agent.id], epsilon, use_anchor_q) for agent in self.agents]
-            joint_last_onehot_a = np.eye(self.args.action_dim)[joint_action]
+            joint_action = [agent.choose_action(self.env.get_obs_agent(agent.id), self.env.get_avail_agent_actions(agent.id), epsilon, use_anchor_q) for agent in self.agents]
 
             try:
                 r, done, info = self.env.step(joint_action)
@@ -267,38 +279,28 @@ class VDN_Runner(object):
             win_tag = True if done and 'battle_won' in info and info['battle_won'] else False
             episode_reward += r
 
+
             if not evaluate:
                 if done and episode_step + 1 != self.args.episode_limit:
                     dw = True
+
                 else:    
                     dw = False
 
                 for agent in self.agents:
-                    
-                    agent.replay_buffer.store_transition(
-                        episode_step = episode_step,
-                        obs = joint_obs[agent.id],
-                        avail_a = joint_avail_a[agent.id],
-                        last_onehot_a = joint_last_onehot_a[agent.id],
-                        a = joint_action[agent.id],
-                        r = r,
-                        dw = dw
-                        )
+                    agent.store_transition(episode_step = episode_step, r = r, dw = dw)
                         
-
                 self.epsilon = self.epsilon - self.args.epsilon_decay if self.epsilon - self.args.epsilon_decay > self.args.epsilon_min else self.args.epsilon_min
 
             if done:
                 break
 
         if not evaluate:
-            joint_obs = self.env.get_obs()
-            joint_avail_a = self.env.get_avail_actions()
             for agents in self.agents:
                 agents.replay_buffer.store_last_step(
-                    episode_step = episode_step,
-                    obs = joint_obs[agents.id],
-                    avail_a = joint_avail_a[agents.id]
+                    episode_step = episode_step+1,
+                    obs = self.env.get_obs_agent(agents.id),
+                    avail_a = self.env.get_avail_agent_actions(agents.id)
                     )
 
         return win_tag, episode_reward, episode_step + 1
@@ -318,9 +320,9 @@ class VDN_Runner(object):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hyperparameter Setting for QMIX and VDN in SMAC environment")
-    parser.add_argument("--max_train_steps", type=int, default=int(5e5), help=" Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(1e6), help=" Maximum number of training steps")
     parser.add_argument("--evaluate_freq", type=float, default=5000, help="Evaluate the policy every 'evaluate_freq' steps")
-    parser.add_argument("--evaluate_times", type=float, default=32, help="Evaluate times")
+    parser.add_argument("--evaluate_times", type=float, default=20, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
 
     parser.add_argument("--algorithm", type=str, default="QTRAN", help="QMIX or VDN")
@@ -331,23 +333,24 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (the number of episodes)")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lambda_opt", type=float, default=0.01, help="The coefficient of the factorizing error for optimal actions regularization term")
-    parser.add_argument("--lambda_nopt", type=float, default=0.0001, help="The coefficient of the factorizing error for non-optimal actions regularization term")
+    parser.add_argument("--lambda_opt", type=float, default=1, help="The coefficient of the factorizing error for optimal actions regularization term")
+    parser.add_argument("--lambda_nopt", type=float, default=0.1, help="The coefficient of the factorizing error for non-optimal actions regularization term")
     parser.add_argument("--rnn_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of RNN")
     parser.add_argument("--mlp_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of MLP")
-    parser.add_argument("--use_rnn", type=bool, default=False, help="Whether to use RNN")
+    parser.add_argument("--use_rnn", type=bool, default=True, help="Whether to use RNN")
     parser.add_argument("--use_orthogonal_init", type=bool, default=True, help="Orthogonal initialization")
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="The norm of the gradient clip")
-    parser.add_argument("--use_lr_decay", type=bool, default=True, help="use lr decay")
-    parser.add_argument("--use_RMS", type=bool, default=True, help="Whether to use RMS,if False, we will use Adam")
+    parser.add_argument("--use_lr_decay", type=bool, default=False, help="use lr decay")
+    parser.add_argument("--use_RMS", type=bool, default=True, help="Whether to use RMS")
+    parser.add_argument("--use_Adam", type=bool, default=False, help="Whether to use Adam")
     parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
-    parser.add_argument("--use_double_q", type=bool, default=False, help="Whether to use double q-learning")
+    parser.add_argument("--use_double_q", type=bool, default=True, help="Whether to use double q-learning")
     parser.add_argument("--use_hard_update", type=bool, default=True, help="Whether to use hard update")
     parser.add_argument("--target_update_freq", type=int, default=200, help="Update frequency of the target network")
     parser.add_argument("--tau", type=int, default=0.005, help="If use soft update")
-    parser.add_argument("--use_secret_sharing", type=bool, default=True, help="Whether to use secret sharing")
-    parser.add_argument("--use_poisson_sampling", type=bool, default=True, help="Whether to use poisson sampling")
+    parser.add_argument("--use_secret_sharing", type=bool, default=False, help="Whether to use secret sharing")
+    parser.add_argument("--use_poisson_sampling", type=bool, default=False, help="Whether to use poisson sampling")
     parser.add_argument("--use_dp", type=bool, default=False, help="Whether to use differential privacy")
     parser.add_argument("--noise_multiplier", type=float, default=0.8, help="Noise multiplier")
     parser.add_argument("--delta", type=float, default=None, help="Delta")
@@ -369,6 +372,6 @@ if __name__ == '__main__':
 
     env_names = ['3m', '8m', '2s3z']
     env_index = 0
-    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id=509713, seed=0)
+    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id=5171208, seed=0)
     runner.run()
         
