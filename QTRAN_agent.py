@@ -9,7 +9,7 @@ from opacus.accountants import RDPAccountant
 
 
 
-class QTRAN_Agent(object):
+class QTRAN_Base_Agent(object):
     def __init__(self, args, id, seed):
         args.id = id
         self.id = id
@@ -39,7 +39,6 @@ class QTRAN_Agent(object):
         self.use_poisson_sampling = args.use_poisson_sampling
         self.use_dp = args.use_dp
         self.noise_multiplier = args.noise_multiplier
-        self.seed = seed
         self.device = args.device
         self.replay_buffer = ReplayBuffer(args)
         self.buffer_throughput = args.buffer_throughput
@@ -48,8 +47,11 @@ class QTRAN_Agent(object):
 
         self.last_onehot_a = torch.zeros(self.action_dim)
 
+        self.update_seed(seed)
+
         # assert that if use_dp, then use_grad_clip and use_poission_sampling and noise_multiplier>0
         if self.use_dp:
+            raise NotImplementedError
             assert self.use_grad_clip
             assert self.use_poisson_sampling
             assert self.noise_multiplier > 0
@@ -65,13 +67,14 @@ class QTRAN_Agent(object):
         if self.use_rnn:
             if self.use_dp:
                 raise NotImplementedError
-            self.q_network = Q_network_RNN(args, self.input_dim)
-            self.target_q_network = Q_network_RNN(args, self.input_dim)
-            self.h_v_network = H_V_network(args, self.input_dim)
-            self.target_h_v_network = H_V_network(args, self.input_dim)
-            self.q_jt_network = Q_jt_network_MLP(args, 2 * self.rnn_hidden_dim)
-            self.target_q_jt_network = Q_jt_network_MLP(args, 2 * self.rnn_hidden_dim)
-            self.v_jt_network = V_jt_network_MLP(args, self.rnn_hidden_dim)
+            self.q_network = Q_network_RNN(args, self.input_dim + self.action_dim)
+            self.target_q_network = Q_network_RNN(args, self.input_dim + self.action_dim)
+            self.v_network = V_network_RNN(args, self.input_dim)
+            self.q_jt_network = Q_jt_network_MLP(args, self.rnn_hidden_dim, self.seed)
+            self.target_q_jt_network = Q_jt_network_MLP(args, self.rnn_hidden_dim, self.seed)
+            self.update_seed()
+            self.v_jt_network = V_jt_network_MLP(args, self.rnn_hidden_dim, self.seed)
+            self.update_seed()
             
             if self.use_anchoring:
                 raise NotImplementedError
@@ -91,46 +94,37 @@ class QTRAN_Agent(object):
             
 
         self.target_q_network.load_state_dict(self.q_network.state_dict())
-        self.target_h_v_network.load_state_dict(self.h_v_network.state_dict())
         self.target_q_jt_network.load_state_dict(self.q_jt_network.state_dict())
-
         if self.use_anchoring:
             raise NotImplementedError
             self.anchor_q_network.load_state_dict(self.q_network.state_dict())
 
         self.q_network.to(self.device)
         self.target_q_network.to(self.device)
-        self.h_v_network.to(self.device)
-        self.target_h_v_network.to(self.device)
+        self.v_network.to(self.device)
         self.q_jt_network.to(self.device)
         self.target_q_jt_network.to(self.device)
         self.v_jt_network.to(self.device)
-
-
-
-
-
         if self.use_anchoring:
             raise NotImplementedError
             self.anchor_q_network.to(self.device)
 
-        self.eval_parameters = list(self.q_network.parameters()) + list(self.q_jt_network.parameters()) + list(self.v_jt_network.parameters()) + list(self.h_v_network.parameters())
+        self.eval_parameters = list(self.q_network.parameters()) + list(self.q_jt_network.parameters()) + list(self.v_jt_network.parameters()) + list(self.v_network.parameters())
         if self.use_RMS:
             self.optimizer = torch.optim.RMSprop(self.eval_parameters, lr=self.lr, alpha = 0.99, eps = 0.00001)
         elif self.use_Adam:
-            self.optimizer = torch.optim.Adam(self.eval_parameters, lr=self.lr)
+            self.optimizer = torch.optim.Adam(self.eval_parameters, lr=self.lr, weight_decay=1e-2)
         else: 
-            self.optimizer = torch.optim.SGD(self.eval_parameters, lr=self.lr, weight_decay=1e-2, momentum=0.5)
+            self.optimizer = torch.optim.SGD(self.eval_parameters, lr=self.lr, weight_decay=1e-2)
 
         if self.use_dp:
+            raise NotImplementedError
             self.q_network = GradSampleModule(self.q_network)
             self.q_network.register_full_backward_hook(forbid_accumulation_hook)
             self.target_q_network = GradSampleModule(self.target_q_network)
             self.target_q_network.register_full_backward_hook(forbid_accumulation_hook)
-            self.h_v_network = GradSampleModule(self.h_v_network)
-            self.h_v_network.register_full_backward_hook(forbid_accumulation_hook)
-            self.target_h_v_network = GradSampleModule(self.target_h_v_network)
-            self.target_h_v_network.register_full_backward_hook(forbid_accumulation_hook)
+            self.v_network = GradSampleModule(self.h_v_network)
+            self.v_network.register_full_backward_hook(forbid_accumulation_hook)
             self.q_jt_network = GradSampleModule(self.q_jt_network)
             self.q_jt_network.register_full_backward_hook(forbid_accumulation_hook)
             self.target_q_jt_network = GradSampleModule(self.target_q_jt_network)
@@ -154,30 +148,38 @@ class QTRAN_Agent(object):
 
         self.train_step = 0
 
-    def choose_action(self, local_obs, avail_a, epsilon, evaluate_anchor_q=False):
+    def update_seed(self, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+            self.seed = seed
+        else:
+            torch.manual_seed(self.seed)
+            self.seed = torch.randint(0, 2**32 - 1, (1,)).item()
+
+    def choose_action(self, local_obs, avail_a, epsilon, seed):
         self.obs = local_obs
         self.avail_a = avail_a
         with torch.no_grad():
+            self.update_seed(seed)
             if torch.rand(1).item() <= epsilon:
                 a = torch.where(torch.tensor(avail_a)==1)[0][torch.randint(0, sum(avail_a), (1,)).item()].item()
 
             else:
-                inputs = []
-                obs = torch.tensor(local_obs, dtype=torch.float32, device=self.device)
-                inputs.append(obs)
-                if self.add_last_action:
-                    inputs.append(self.last_onehot_a)
-                
-                # concatenate all inputs
-                inputs = torch.cat(inputs, dim=-1)
-
-                if evaluate_anchor_q:
-                    raise NotImplementedError
-                else:
-                    q_values = self.q_network(inputs)
-                avail_a = torch.tensor(avail_a, dtype=torch.float32, device="cpu")
-                q_values[avail_a == 0.0] = float('-inf')
-                a = q_values.max(dim=-1)[1].item()
+                q_logits = torch.zeros((self.action_dim,))
+                rnn_hidden_state = self.q_network.rnn_hidden
+                for a in range(self.action_dim):
+                    inputs = []
+                    obs = torch.tensor(local_obs, dtype=torch.float32, device=self.device)
+                    inputs.append(obs)
+                    if self.add_last_action:
+                        inputs.append(self.last_onehot_a)
+                    inputs.append(torch.eye(self.action_dim)[a])
+                    inputs = torch.cat(inputs, dim=-1)
+                    q_logits[a] = self.q_network(inputs).item()
+                    self.q_network.rnn_hidden = rnn_hidden_state   
+                avail_a = torch.tensor(avail_a, dtype=torch.bool, device="cpu")
+                q_logits[avail_a == False] = float('-inf')
+                a = q_logits.max(dim=-1)[1].item()
         self.current_a = a
         return a
     
@@ -209,6 +211,8 @@ class QTRAN_Agent(object):
         return self.decoder(torch.sum(shares, dim=0) % self.Q)
     
     def initiate_peer2peer_messaging(self, seed):
+
+        # Draw a batch from the replay buffer and skip if the batch is empty
         self.batch, self.max_episode_len, batch_length = self.replay_buffer.sample(seed)
         self.current_batch_size = batch_length
         if batch_length is None:
@@ -216,53 +220,72 @@ class QTRAN_Agent(object):
             return
         
         self.empty_batch = False
-
+        
+        # Get the inputs
         self.inputs = self.get_inputs(self.batch).clone().detach()
         
         if self.use_rnn:
             self.q_network.rnn_hidden = None
             self.target_q_network.rnn_hidden = None
-            self.h_v_network.rnn_hidden = None
-            self.target_h_v_network.rnn_hidden = None
+            self.v_network.rnn_hidden = None
 
-            q_evals, q_targets, h_q_evals, h_q_targets, h_v_evals, h_v_targets = [], [], [], [], [], []
+            q_evals, q_targets, v_evals, h_q_evals, h_q_targets, h_v_evals = [], [], [], [], [], []
             for t in range(self.max_episode_len):  # t=0,1,2,...(episode_len-1)
-                q_eval = self.q_network(self.inputs[:, t].reshape(-1, self.input_dim))  # q_eval.shape=(batch_size, action_dim)
-                h_q_eval = self.q_network.rnn_hidden #q_hidden.shape = (batch_size, action_dim)
-                q_target = self.target_q_network(self.inputs[:, t + 1].reshape(-1, self.input_dim))
-                h_q_target = self.target_q_network.rnn_hidden
-                q_evals.append(q_eval.reshape(self.batch_size, -1))  # q_eval.shape=(batch_size,N,action_dim)
-                q_targets.append(q_target.reshape(self.batch_size, -1))
-                h_q_evals.append(h_q_eval.reshape(self.batch_size, -1))
-                h_q_targets.append(h_q_target.reshape(self.batch_size, -1))
+                q_network_rnn_state = self.q_network.rnn_hidden
+                target_q_network_rnn_state = self.target_q_network.rnn_hidden
+                q_eval_logits, q_target_logits, h_q_logits, h_q_target_logits = [], [], [], []
+                for a in range(self.action_dim):
+                    one_hot_a = torch.eye(self.action_dim)[a]
+                    
+                    inputs_w_one_hot_a = torch.cat([self.inputs[:, t], one_hot_a.unsqueeze(0).repeat(self.inputs.shape[0], 1).clone()], dim=-1)
+                    q_eval_logits.append(self.q_network(inputs_w_one_hot_a).squeeze(-1))
+                    h_q_logits.append(self.q_network.rnn_hidden)
+                    self.q_network.rnn_hidden = q_network_rnn_state
 
-                h_v_eval = self.h_v_network(self.inputs[:, t].reshape(-1, self.input_dim))
-                h_v_target = self.target_h_v_network(self.inputs[:, t + 1].reshape(-1, self.input_dim))
-                h_v_evals.append(h_v_eval.reshape(self.batch_size, -1))
-                h_v_targets.append(h_v_target.reshape(self.batch_size, -1))
+                    next_input_w_onehot_a = torch.cat([self.inputs[:, t + 1], one_hot_a.unsqueeze(0).repeat(self.inputs.shape[0], 1).clone()], dim=-1)
+                    q_target_logits.append(self.target_q_network(next_input_w_onehot_a).squeeze(-1))
+                    h_q_target_logits.append(self.target_q_network.rnn_hidden)
+                    self.target_q_network.rnn_hidden = target_q_network_rnn_state
+                
+                q_eval_logits_stacked = torch.stack(q_eval_logits, dim=-1)
+                q_target_logits_stacked = torch.stack(q_target_logits, dim=-1)
+                h_q_logits_stacked = torch.stack(h_q_logits, dim=-1)
+                h_q_target_logits_stacked = torch.stack(h_q_target_logits, dim=-1)
+                
+                v_eval = self.v_network(self.inputs[:, t + 1].reshape(-1, self.input_dim)).squeeze(-1)
+                h_v_eval = self.v_network.rnn_hidden
+                v_evals.append(v_eval.reshape(self.batch_size, -1))
+                h_v_evals.append(h_v_eval)
 
-        # Stack them according to the time (dim=1)
-            self.q_evals = torch.stack(q_evals, dim=1)  # q_evals.shape=(batch_size,max_episode_len,N,action_dim)
+                q_evals.append(q_eval_logits_stacked)
+                q_targets.append(q_target_logits_stacked)
+                h_q_evals.append(h_q_logits_stacked)
+                h_q_targets.append(h_q_target_logits_stacked)
+            
+            self.q_evals = torch.stack(q_evals, dim=1)
             self.q_targets = torch.stack(q_targets, dim=1)
+            self.v_evals = torch.stack(v_evals, dim=1)
             self.h_q_evals = torch.stack(h_q_evals, dim=1)
             self.h_q_targets = torch.stack(h_q_targets, dim=1)
             self.h_v_evals = torch.stack(h_v_evals, dim=1)
-            self.h_v_targets = torch.stack(h_v_targets, dim=1)
 
         else:
             raise NotImplementedError
-            self.q_evals = self.q_network(self.inputs[:, :-1])  # q_evals.shape=(batch_size,max_episode_len,action_dim)
-            self.q_targets = self.target_q_network(self.inputs[:, 1:])
-
-        self.q_evals[self.batch['avail_a'][:, :-1] == 0] = float('-inf')
-        self.q_targets[self.batch['avail_a'][:, 1:] == 0] = float('-inf')
-        self.a_opt = self.q_evals.max(dim=-1)[1]  # a_opt is the actions that maximize the agent's q value
+            # self.q_evals = self.q_network(self.inputs[:, :-1])  # q_evals.shape=(batch_size,max_episode_len,action_dim)
+            # self.q_targets = self.target_q_network(self.inputs[:, 1:])
+        
+        # Mask the unavailable actions
+        q_evals_masked = self.q_evals.clone()
+        q_targets_masked = self.q_targets.clone()
+        q_evals_masked[self.batch['avail_a'][:, :-1] == 0] = float('-inf')
+        q_targets_masked[self.batch['avail_a'][:, 1:] == 0] = float('-inf')
+        self.a_opt = q_evals_masked.max(dim=-1)[1]  # a_opt is the actions that maximize the agent's q value
 
         with torch.no_grad():
             if self.use_double_q:  # If use double q-learning, we use eval_net to choose actions, and use target_net to compute q_target
-                self.a_opt_next = self.q_evals.max(dim=-1)[1]  # q_evals.shape=(batch_size, max_episode_len)
+                self.a_opt_next = q_evals_masked.max(dim=-1)[1]  # q_evals.shape=(batch_size, max_episode_len)
             else:
-                self.a_opt_next = self.q_targets.max(dim=-1)[1]
+                self.a_opt_next = q_targets_masked.max(dim=-1)[1]
 
 
     def peer2peer_messaging_for_computing_q_jt_sum(self, seed, mode, sender_id = None, sender_message = None):
@@ -277,6 +300,7 @@ class QTRAN_Agent(object):
             # make n_agent copies of q_evals and q_targets each of which multiplied by 1/n_agents
             with torch.no_grad():
                 if self.use_secret_sharing:
+                    self.update_seed(seed)
                     self.secret = self.contribution_to_q_jt_sum
                     self.secret_shares = self.encrypt(self.secret)
                 else:
@@ -306,6 +330,7 @@ class QTRAN_Agent(object):
             self.contribution_to_q_jt_sum_opt = torch.gather(self.q_evals, dim=-1, index=self.a_opt.unsqueeze(-1)).squeeze(-1)
             with torch.no_grad():
                 if self.use_secret_sharing:
+                    self.update_seed(seed)
                     self.secret = self.contribution_to_q_jt_sum_opt
                     self.secret_shares = self.encrypt(self.secret)
                 else:
@@ -330,15 +355,17 @@ class QTRAN_Agent(object):
 
     def peer2peer_messaging_for_computing_q_jt(self, seed, mode, sender_id = None, sender_message = None):
         if '1' in mode:
+            self.message_to_send = torch.zeros((self.current_batch_size, self.max_episode_len, self.rnn_hidden_dim, self.n_agents), device=self.device, dtype=torch.float32)
+            self.message_to_rece = torch.zeros((self.current_batch_size, self.max_episode_len, self.rnn_hidden_dim, self.n_agents), device=self.device, dtype=torch.float32)
+            reshaped_a = self.batch['a'].unsqueeze(-1).expand(-1, -1, self.h_q_evals.size(-2)).unsqueeze(-1)
+            self.contribution_to_sum_h_q_evals = torch.gather(self.h_q_evals, dim=-1, index=reshaped_a).squeeze(-1)
             with torch.no_grad():
-                self.message_to_send = torch.zeros((self.current_batch_size, self.max_episode_len, 2 * self.rnn_hidden_dim, self.n_agents), device=self.device, dtype=torch.float32)
-                self.message_to_rece = torch.zeros((self.current_batch_size, self.max_episode_len, 2 * self.rnn_hidden_dim, self.n_agents), device=self.device, dtype=torch.float32)
-
                 if self.use_secret_sharing:
-                    self.secret = torch.concat([self.h_q_evals, self.h_v_evals], dim=-1)
+                    self.update_seed(seed)
+                    self.secret = self.contribution_to_sum_h_q_evals
                     self.secret_shares = self.encrypt(self.secret)
                 else:
-                    self.secret = torch.concat([self.h_q_evals, self.h_v_evals], dim=-1)
+                    self.secret = self.contribution_to_sum_h_q_evals
                     self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, 1, self.n_agents) / self.n_agents
                     
         elif '2' in mode:
@@ -352,166 +379,143 @@ class QTRAN_Agent(object):
             return self.sum_shares
         
         elif '4' in mode:
-            self.sum_h_evals = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
-            self.sum_h_q_evals_excluding_self = self.sum_h_evals[:,:,:self.rnn_hidden_dim] - self.h_q_evals.detach()
-            assert self.sum_h_q_evals_excluding_self.requires_grad == False
+            self.sum_h_q_evals = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
+            # self.sum_h_q_evals_excluding_self = self.sum_h_evals[:,:,:self.rnn_hidden_dim] - self.h_q_evals.detach()
+            # assert self.sum_h_q_evals_excluding_self.requires_grad == False
+            # assert self.h_v_evals.requires_grad == True
+            # self.q_jt_evals = self.q_jt_network(torch.concat([self.sum_h_q_evals_excluding_self, self.h_v_evals], dim=-1))
+            # assert self.q_jt_evals.requires_grad == True
+            assert self.sum_h_q_evals.requires_grad == False
+            self.sum_h_q_evals += self.contribution_to_sum_h_q_evals - self.contribution_to_sum_h_q_evals.detach()
+            assert self.sum_h_q_evals.requires_grad == True
+            self.q_jt = self.q_jt_network(self.sum_h_q_evals).squeeze(-1)
+            assert self.q_jt.requires_grad == True
+            
+
+
+    def peer2peer_messaging_for_computing_y_dqn(self, seed, mode, sender_id = None, sender_message = None):
+        if '1' in mode:
+            self.reshaped_a_opt = self.a_opt.unsqueeze(-1).expand(-1, -1, self.h_q_targets.size(-2)).unsqueeze(-1)
+            self.contribution_to_sum_h_q_targets = torch.gather(self.h_q_targets, dim=-1, index=self.reshaped_a_opt).squeeze(-1)
+            with torch.no_grad():
+                if self.use_secret_sharing:
+                    self.update_seed(seed)
+                    self.secret = self.contribution_to_sum_h_q_targets
+                    self.secret_shares = self.encrypt(self.secret)
+                else:
+                    self.secret = self.contribution_to_sum_h_q_targets
+                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, 1, self.n_agents) / self.n_agents
+                    
+        elif '2' in mode:
+            self.message_to_rece[:,:,:,sender_id] = sender_message
+
+        elif '3' in mode:
+            if self.use_secret_sharing:
+                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
+            else:
+                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
+            return self.sum_shares
+        
+        elif '4' in mode:
+            self.sum_h_q_targets = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
+            # self.sum_h_q_targets_excluding_self = self.sum_h_targets[:,:,:self.rnn_hidden_dim] - self.h_q_targets.detach()
+            # assert self.sum_h_q_targets_excluding_self.requires_grad == False
+            # with torch.no_grad():
+            #     self.q_jt_targets = self.target_q_jt_network(torch.concat([self.sum_h_q_targets_excluding_self, self.h_v_targets], dim=-1))
+            self.sum_h_q_targets += self.contribution_to_sum_h_q_targets - self.contribution_to_sum_h_q_targets.detach()
+            assert self.sum_h_q_targets.requires_grad == True
+            with torch.no_grad():
+                self.q_jt_targets = self.q_jt_network(self.sum_h_q_targets).squeeze(-1)
+            assert self.q_jt_targets.requires_grad == False
+            self.y_dqn = self.batch['r'].squeeze(-1) + self.gamma * (1 - self.batch['dw'].squeeze(-1)) * self.q_jt_targets
+            assert self.y_dqn.requires_grad == False
+
+    def peer2peer_messaging_for_computing_q_jt_opt(self, seed, mode, sender_id = None, sender_message = None):
+        if '1' in mode:
+            self.contribution_to_sum_h_q_evals_opt = torch.gather(self.h_q_evals, dim=-1, index=self.reshaped_a_opt).squeeze(-1)
+            with torch.no_grad():
+                if self.use_secret_sharing:
+                    self.update_seed(seed)
+                    self.secret = self.contribution_to_sum_h_q_evals_opt
+                    self.secret_shares = self.encrypt(self.secret)
+                else:
+                    self.secret = self.contribution_to_sum_h_q_evals_opt
+                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, 1, self.n_agents) / self.n_agents
+
+        elif '2' in mode:
+            self.message_to_rece[:,:,:,sender_id] = sender_message
+
+        elif '3' in mode:
+            if self.use_secret_sharing:
+                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
+            else:
+                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
+            return self.sum_shares
+        
+        elif '4' in mode:
+            self.sum_h_q_evals_opt = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
+            assert self.sum_h_q_evals_opt.requires_grad == False
+            assert self.contribution_to_sum_h_q_evals_opt.requires_grad == True
+            self.sum_h_q_evals_opt += self.contribution_to_sum_h_q_evals_opt - self.contribution_to_sum_h_q_evals_opt.detach()
+            assert self.sum_h_q_evals_opt.requires_grad == True
+            self.q_jt_opt = self.q_jt_network(self.sum_h_q_evals_opt).squeeze(-1)
+            assert self.q_jt_opt.requires_grad == True
+
+    def peer2peer_messaging_for_computing_v_jt(self, seed, mode, sender_id = None, sender_message = None):
+        if '1' in mode:
+            with torch.no_grad():
+                if self.use_secret_sharing:
+                    self.update_seed(seed)
+                    self.secret = self.h_v_evals
+                    self.secret_shares = self.encrypt(self.secret)
+                else:
+                    self.secret = self.h_v_evals
+                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, 1, self.n_agents) / self.n_agents
+        
+        elif '2' in mode:
+            self.message_to_rece[:,:,:,sender_id] = sender_message
+
+        elif '3' in mode:
+            if self.use_secret_sharing:
+                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
+            else:
+                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
+            return self.sum_shares
+        
+        elif '4' in mode:
+            self.sum_h_v_evals = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
+            assert self.sum_h_v_evals.requires_grad == False
             assert self.h_v_evals.requires_grad == True
-            self.q_jt_evals = self.q_jt_network(torch.concat([self.sum_h_q_evals_excluding_self, self.h_v_evals], dim=-1))
-            assert self.q_jt_evals.requires_grad == True
-            
-
-
-    def peer2peer_messaging_for_computing_q_jt_target(self, seed, mode, sender_id = None, sender_message = None):
-        if '1' in mode:
-            with torch.no_grad():
-
-                if self.use_secret_sharing:
-                    self.secret = torch.concat([self.h_q_targets, self.h_v_targets], dim=-1)
-                    self.secret_shares = self.encrypt(self.secret)
-                else:
-                    self.secret = torch.concat([self.h_q_targets, self.h_v_targets], dim=-1)
-                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, 1, self.n_agents) / self.n_agents
-                    
-        elif '2' in mode:
-            self.message_to_rece[:,:,:,sender_id] = sender_message
-
-        elif '3' in mode:
-            if self.use_secret_sharing:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
-            else:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
-            return self.sum_shares
-        
-        elif '4' in mode:
-            self.sum_h_targets = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
-            self.sum_h_q_targets_excluding_self = self.sum_h_targets[:,:,:self.rnn_hidden_dim] - self.h_q_targets.detach()
-            assert self.sum_h_q_targets_excluding_self.requires_grad == False
-            with torch.no_grad():
-                self.q_jt_targets = self.target_q_jt_network(torch.concat([self.sum_h_q_targets_excluding_self, self.h_v_targets], dim=-1))
-
-    def peer2peer_messaging_for_computing_L_td(self, seed, mode, sender_id = None, sender_message = None):
-        if '1' in mode:
-            self.message_to_send = torch.zeros((self.current_batch_size, self.max_episode_len, self.n_agents), device=self.device, dtype=torch.float32)
-            self.message_to_rece = torch.zeros((self.current_batch_size, self.max_episode_len, self.n_agents), device=self.device, dtype=torch.float32)
-            self.q_jt = torch.gather(self.q_jt_evals, dim=-1, index=self.batch['a'].unsqueeze(-1)).squeeze(-1)
-
-            with torch.no_grad():
-                self.q_jt_target = torch.gather(self.q_jt_targets, dim=-1, index=self.a_opt_next.unsqueeze(-1)).squeeze(-1)
-
-            self.L_td = self.q_jt - self.batch['r'].squeeze(-1) + self.gamma * (1 - self.batch['dw'].squeeze(-1)) * self.q_jt_target
-            
-            with torch.no_grad():
-                if self.use_secret_sharing:
-                    self.secret = self.L_td
-                    self.secret_shares = self.encrypt(self.secret)
-                else:
-                    self.secret = self.L_td
-                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents
-                    
-        elif '2' in mode:
-            self.message_to_rece[:,:,sender_id] = sender_message
-
-        elif '3' in mode:
-            if self.use_secret_sharing:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
-            else:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
-            return self.sum_shares
-        
-        elif '4' in mode:
-            self.L_td_sum = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
-            assert self.L_td_sum.requires_grad == False
-            assert self.L_td.requires_grad == True
-            self.L_td_sum += self.L_td - self.L_td.detach()
-            assert self.L_td_sum.requires_grad == True
-
-    def peer2peer_messaging_for_computing_L_opt(self, seed, mode, sender_id = None, sender_message = None):
-        if '1' in mode:
-            with torch.no_grad():
-                self.q_jt_hat_opt = torch.gather(self.q_jt_targets, dim = -1, index=self.a_opt.unsqueeze(-1)).squeeze(-1)
-            self.sum_h_v_evals_excluding_self = self.sum_h_evals[:,:,-self.rnn_hidden_dim:] - self.h_v_evals.detach()
-            self.sum_h_v_evals = self.sum_h_v_evals_excluding_self + self.h_v_evals
+            self.sum_h_v_evals += self.h_v_evals - self.h_v_evals.detach()
             assert self.sum_h_v_evals.requires_grad == True
             self.v_jt = self.v_jt_network(self.sum_h_v_evals).squeeze(-1)
             assert self.v_jt.requires_grad == True
-
-            self.L_opt = self.q_jt_sum_opt - self.q_jt_hat_opt + self.v_jt
-
-            with torch.no_grad():
-                if self.use_secret_sharing:
-                        self.secret = self.L_opt
-                        self.secret_shares = self.encrypt(self.secret)
-                else:
-                        self.secret = self.L_opt
-                        self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents
-                    
-        elif '2' in mode:
-            self.message_to_rece[:,:,sender_id] = sender_message
-
-        elif '3' in mode:
-            if self.use_secret_sharing:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
-            else:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
-            return self.sum_shares
-        
-        elif '4' in mode:
-            self.sum_L_opt = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
-            assert self.sum_L_opt.requires_grad == False
-            self.sum_L_opt += self.L_opt - self.L_opt.detach()
-            assert self.sum_L_opt.requires_grad == True
-
-    def peer2peer_messaging_for_computing_L_nopt_min(self, seed, mode, sender_id = None, sender_message = None):
-        if '1' in mode:
-            self.q_jt_hat = self.q_jt_evals.detach()
-            self.L_nopt = (self.q_jt_sum.detach() - self.contribution_to_q_jt_sum.detach()).unsqueeze(-1) + self.q_evals - self.q_jt_hat + self.v_jt.unsqueeze(-1)
-            self.L_nopt[self.batch['avail_a'][:, :-1] == 0.0] = float('inf')
-            self.L_nopt_min = torch.min(self.L_nopt, dim=-1)[0]
-
-            with torch.no_grad():
-                if self.use_secret_sharing:
-                    self.secret = self.L_nopt_min
-                    self.secret_shares = self.encrypt(self.secret)
-                else:
-                    self.secret = self.L_nopt_min
-                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents
-                    
-        elif '2' in mode:
-            self.message_to_rece[:,:,sender_id] = sender_message
-
-        elif '3' in mode:
-            if self.use_secret_sharing:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1) % self.Q
-            else:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=-1)
-            return self.sum_shares
-        
-        elif '4' in mode:
-            self.sum_L_nopt_min = self.decrypt(sender_message) if self.use_secret_sharing else sender_message
-            assert self.sum_L_nopt_min.requires_grad == False
-            self.sum_L_nopt_min += self.L_nopt_min - self.L_nopt_min.detach()
-            assert self.sum_L_nopt_min.requires_grad == True
-
-
-
 
             
 
     def train(self, total_steps):
 
+        self.l_td = self.q_jt - self.y_dqn.detach()
+        self.l_opt = self.q_jt_sum_opt - self.q_jt_opt.detach() + self.v_jt
+        self.l_nopt = torch.clamp(self.q_jt_sum - self.q_jt.detach() + self.v_jt, max=0)
+        self.l_td_v = self.contribution_to_q_jt_sum.detach() - self.batch['r'].squeeze(-1) - self.gamma * (1 - self.batch['dw'].squeeze(-1)) * self.v_evals.squeeze(-1)
+
         self.train_step += 1
 
-        masked_L_td = self.L_td * self.batch['active'].squeeze(-1)
-        L_td = (masked_L_td ** 2).sum() / self.batch['active'].sum()
+        masked_l_td = self.l_td * self.batch['active'].squeeze(-1)
+        l_td = (masked_l_td ** 2).sum() / self.batch['active'].sum()
 
-        masked_L_opt = self.L_opt * self.batch['active'].squeeze(-1)
-        L_opt = (masked_L_opt ** 2).sum() / self.batch['active'].sum()
+        masked_l_opt = self.l_opt * self.batch['active'].squeeze(-1)
+        l_opt = (masked_l_opt ** 2).sum() / self.batch['active'].sum()
 
-        masked_L_nopt_min = self.L_nopt_min * self.batch['active'].squeeze(-1)
-        L_nopt_min = (masked_L_nopt_min ** 2).sum() / self.batch['active'].sum()
+        masked_l_nopt = self.l_nopt * self.batch['active'].squeeze(-1)
+        l_nopt = (masked_l_nopt ** 2).sum() / self.batch['active'].sum()
+
+        masked_l_td_v = self.l_td_v * self.batch['active'].squeeze(-1)
+        l_td_v = (masked_l_td_v ** 2).sum() / self.batch['active'].sum()
 
 
-        loss = (L_td + self.lambda_opt * L_opt + self.lambda_nopt * L_nopt_min) / self.n_agents
+        loss = (l_td + l_td_v + self.lambda_opt * l_opt + self.lambda_nopt * l_nopt)
 
 
 
@@ -536,28 +540,31 @@ class QTRAN_Agent(object):
             if self.train_step % self.target_update_freq == 0:
                 self.target_q_network.load_state_dict(self.q_network.state_dict())
                 self.target_q_jt_network.load_state_dict(self.q_jt_network.state_dict())
-                self.target_h_v_network.load_state_dict(self.h_v_network.state_dict())
-                if self.id == 0:
-                    print("Loss: {:.4f}, L_td: {:.4f}, L_opt: {:.4f}, L_nopt_min: {:.4f} \n".format(loss.item(), L_td.item(), L_opt.item(), L_nopt_min.item()))
+                
 
 
         else:
             # Softly update the target networks
             for param, target_param in zip(self.q_network.parameters(), self.target_q_network.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            
+
             for param, target_param in zip(self.q_jt_network.parameters(), self.target_q_jt_network.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-
-            for param, target_param in zip(self.h_v_network.parameters(), self.target_h_v_network.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-
-            
-
 
 
         if self.use_lr_decay:
             self.lr_decay(total_steps)
+        
+        verbose = {
+            'id': self.id,
+            'train_step': self.train_step,
+            'loss': loss.item(),
+            'l_td': l_td.item(),
+            'l_opt': l_opt.item(),
+            'l_nopt': l_nopt.item()
+        }
+    
+        return verbose
 
         
 

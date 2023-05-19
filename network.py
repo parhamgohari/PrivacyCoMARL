@@ -20,7 +20,7 @@ class Q_network_RNN(nn.Module):
 
         self.fc1 = nn.Linear(input_dim, args.rnn_hidden_dim)
         self.rnn = nn.GRUCell(args.rnn_hidden_dim, args.rnn_hidden_dim)
-        self.fc2 = nn.Linear(args.rnn_hidden_dim, args.action_dim)
+        self.fc2 = nn.Linear(args.rnn_hidden_dim, 1)
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
             orthogonal_init(self.rnn)
@@ -42,7 +42,7 @@ class Q_network_MLP(nn.Module):
 
         self.fc1 = nn.Linear(input_dim, args.mlp_hidden_dim)
         self.fc2 = nn.Linear(args.mlp_hidden_dim, args.mlp_hidden_dim)
-        self.fc3 = nn.Linear(args.mlp_hidden_dim, args.action_dim)
+        self.fc3 = nn.Linear(args.mlp_hidden_dim, 1)
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
             orthogonal_init(self.fc2)
@@ -57,29 +57,34 @@ class Q_network_MLP(nn.Module):
     
 
     
-class H_V_network(nn.Module):
+class V_network_RNN(nn.Module):
     def __init__(self, args, input_dim) -> None:
-        super(H_V_network, self).__init__()
+        super(V_network_RNN, self).__init__()
         self.rnn_hidden = None
         self.fc1 = nn.Linear(input_dim, args.rnn_hidden_dim)
         self.rnn = nn.GRUCell(args.rnn_hidden_dim, args.rnn_hidden_dim)
+        self.fc2 = nn.Linear(args.rnn_hidden_dim, 1)
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
             orthogonal_init(self.rnn)
+            orthogonal_init(self.fc2)
+
 
     def forward(self, inputs):
         x = F.relu(self.fc1(inputs))
         self.rnn_hidden = self.rnn(x, self.rnn_hidden)
+        V = self.fc2(self.rnn_hidden)
 
-        return self.rnn_hidden
+        return V
 
 class Q_jt_network_MLP(nn.Module):
-    def __init__(self, args, input_dim) -> None:
+    def __init__(self, args, input_dim, seed) -> None:
         super(Q_jt_network_MLP, self).__init__()
         self.args = args
+        torch.manual_seed(seed)
         self.fc1 = nn.Linear(input_dim, args.mlp_hidden_dim)
         self.fc2 = nn.Linear(args.mlp_hidden_dim, args.mlp_hidden_dim)
-        self.fc3 = nn.Linear(args.mlp_hidden_dim, self.args.action_dim)
+        self.fc3 = nn.Linear(args.mlp_hidden_dim, 1)
 
         if args.use_orthogonal_init:
             orthogonal_init(self.fc1)
@@ -95,11 +100,10 @@ class Q_jt_network_MLP(nn.Module):
 
     
 class V_jt_network_MLP(nn.Module):
-    def __init__(self, args, input_dim) -> None:
+    def __init__(self, args, input_dim, seed) -> None:
         super(V_jt_network_MLP, self).__init__()
-
         self.args = args
-
+        torch.manual_seed(seed)
         self.fc1 = nn.Linear(input_dim, args.mlp_hidden_dim)
         self.fc2 = nn.Linear(args.mlp_hidden_dim, args.mlp_hidden_dim)
         self.fc3 = nn.Linear(args.mlp_hidden_dim, 1)

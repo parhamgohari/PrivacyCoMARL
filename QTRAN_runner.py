@@ -2,14 +2,15 @@ import torch
 from smac.env import StarCraft2Env
 import numpy as np
 import argparse
-from QTRAN_agent import QTRAN_Agent
+from QTRAN_agent import QTRAN_Base_Agent
+from network import Q_jt_network_MLP, V_jt_network_MLP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import time
 
 
 
-class VDN_Runner(object):
+class QTRAN_Base_Runner(object):
     def __init__(self, args, env_name, exp_id, seed, privacy_mechanism = None):
         self.args = args
         self.env_name = env_name
@@ -18,6 +19,7 @@ class VDN_Runner(object):
         self.seed = seed
         self.privacy_mechanism = privacy_mechanism
         self.env = StarCraft2Env(map_name=env_name, seed = self.seed)
+        self.update_seed()
         self.env_info = self.env.get_env_info()
         self.args.n_agents = self.env_info["n_agents"]
         self.n_agents = self.env_info["n_agents"]
@@ -31,17 +33,18 @@ class VDN_Runner(object):
         self.epsilon = self.args.epsilon
 
         if args.use_dp:
+            raise NotImplementedError
             self.privacy_budget = {
                 'epsilon': 0,
                 'delta': 0,
             }
 
         if args.use_anchoring:
+            raise NotImplementedError
             self.anchor_threshold = 0.5
 
-        _, self.seed = self.branch_seed(self.seed)
         # create n_agents VDN agents
-        self.agents = [QTRAN_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
+        self.agents = [QTRAN_Base_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
 
         # creat a tensorboard
         self.writer = SummaryWriter(log_dir="./log/{}_{}_{}".format(self.args.algorithm, env_name, exp_id))
@@ -49,23 +52,31 @@ class VDN_Runner(object):
         self.win_rates = []
         self.total_steps = 0
 
-    def branch_seed(self, current_seed, number_of_branches = 1):
+    def update_seed(self):
         """
         This function is used to generate different seeds for different branches
         """
-        np.random.seed(current_seed)
-        random_seeds = np.random.randint(0, 2 ** 32 - 1, number_of_branches + 1)
-        return random_seeds[:-1], random_seeds[-1]
+        torch.manual_seed(self.seed)
+        self.seed = torch.randint(0, 2**32 - 1, (1,)).item()
 
     def run(self):
         evaluate_num = -1
         pbar = tqdm(total = self.total_steps)
         dp_measured = False
         episode_num = 0
+        losses = []
         while self.total_steps < self.args.max_train_steps:
             if self.total_steps // self.args.evaluate_freq > evaluate_num:
                 self.evaluate_policy()
+                if len(losses) != 0:
+                    print('-----------------------------------------------------------------------------------')
+                    print(losses[-3])
+                    print(losses[-2])
+                    print(losses[-1])
+                    print('-----------------------------------------------------------------------------------')
+                    print('\n')
                 if self.args.use_anchoring:
+                    raise NotImplementedError
                     self.evaluate_policy(use_anchor_q = True)
                 evaluate_num += 1
 
@@ -92,11 +103,13 @@ class VDN_Runner(object):
                     if agent.empty_batch:
                         skip_iteration = True
                         break
+                self.update_seed()
                 if skip_iteration:
                     continue
 
                 # Compute q_jt_sum
                 for agent in self.agents:
+                    self.update_seed()
                     agent.peer2peer_messaging_for_computing_q_jt_sum(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
@@ -113,6 +126,7 @@ class VDN_Runner(object):
 
                 # Compute q_jt_sum_opt
                 for agent in self.agents:
+                    self.update_seed()
                     agent.peer2peer_messaging_for_computing_q_jt_sum_opt(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
@@ -130,6 +144,7 @@ class VDN_Runner(object):
 
                 # Compute q_jt
                 for agent in self.agents:
+                    self.update_seed()
                     agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
@@ -145,86 +160,74 @@ class VDN_Runner(object):
                         agent.peer2peer_messaging_for_computing_q_jt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
 
 
-
-                # Compute q_jt_target
+                # Compute y_dqn
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '1. compute message')
+                    self.update_seed()
+                    agent.peer2peer_messaging_for_computing_y_dqn(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_y_dqn(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_y_dqn(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
                 for agent in self.agents:
                     if self.args.use_secret_sharing:
-                        agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                        agent.peer2peer_messaging_for_computing_y_dqn(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
                     else:
-                        agent.peer2peer_messaging_for_computing_q_jt_target(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+                        agent.peer2peer_messaging_for_computing_y_dqn(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
 
-                # Compute L_td
+
+                # Compute q_jt_opt
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '1. compute message')
+                    self.update_seed()
+                    agent.peer2peer_messaging_for_computing_q_jt_opt(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_q_jt_opt(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_q_jt_opt(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
                 for agent in self.agents:
                     if self.args.use_secret_sharing:
-                        agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                        agent.peer2peer_messaging_for_computing_q_jt_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
                     else:
-                        agent.peer2peer_messaging_for_computing_L_td(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+                        agent.peer2peer_messaging_for_computing_q_jt_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
 
-                # Compute L_opt
+                # Compute v_jt
                 for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '1. compute message')
+                    self.update_seed()
+                    agent.peer2peer_messaging_for_computing_v_jt(self.seed, mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_for_computing_v_jt(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_v_jt(self.seed, mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
                 for agent in self.agents:
                     if self.args.use_secret_sharing:
-                        agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
+                        agent.peer2peer_messaging_for_computing_v_jt(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
                     else:
-                        agent.peer2peer_messaging_for_computing_L_opt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
-
-                # Compute L_nopt_min
-                for agent in self.agents:
-                    agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '1. compute message')
-                local_sums = []
-                for receiver_agent in self.agents:
-                    for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '3. compute sum'))
-                local_sums = torch.stack(local_sums)
-
-                for agent in self.agents:
-                    if self.args.use_secret_sharing:
-                        agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '4. receive the sum of local sums', sender_message = local_sums)
-                    else:
-                        agent.peer2peer_messaging_for_computing_L_nopt_min(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+                        agent.peer2peer_messaging_for_computing_v_jt(self.seed, mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
 
                 # train
+                federated_model_grads = [None, None, None]
                 for agent in self.agents:
-                    agent.train(self.total_steps)
+                    verbose = agent.train(self.total_steps)
+                    losses.append(verbose)
 
                 
 
             if self.args.use_dp:
+                raise NotImplementedError
                 if min([agent.replay_buffer.current_size for agent in self.agents]) == self.args.buffer_size and not dp_measured:
                     self.privacy_budget = {
                         'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) /self.args.buffer_throughput,
                         'delta': self.args.delta /self.args.buffer_throughput
                     }
                     dp_measured = True
-                
-
 
         self.evaluate_policy()
         self.env.close()
@@ -264,8 +267,10 @@ class VDN_Runner(object):
         for episode_step in range(self.args.episode_limit):
             # get observations
             epsilon = 0 if evaluate else self.epsilon
-            joint_action = [agent.choose_action(self.env.get_obs_agent(agent.id), self.env.get_avail_agent_actions(agent.id), epsilon, use_anchor_q) for agent in self.agents]
-
+            joint_action = []
+            for agent in self.agents:
+                self.update_seed()
+                joint_action.append(agent.choose_action(self.env.get_obs_agent(agent.id), self.env.get_avail_agent_actions(agent.id), epsilon, self.seed))
             try:
                 r, done, info = self.env.step(joint_action)
             except:
@@ -319,7 +324,7 @@ class VDN_Runner(object):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser("Hyperparameter Setting for QMIX and VDN in SMAC environment")
+    parser = argparse.ArgumentParser("Hyperparameter Setting for QTRAN in SMAC environment")
     parser.add_argument("--max_train_steps", type=int, default=int(1e6), help=" Maximum number of training steps")
     parser.add_argument("--evaluate_freq", type=float, default=5000, help="Evaluate the policy every 'evaluate_freq' steps")
     parser.add_argument("--evaluate_times", type=float, default=20, help="Evaluate times")
@@ -340,11 +345,11 @@ if __name__ == '__main__':
     parser.add_argument("--use_rnn", type=bool, default=True, help="Whether to use RNN")
     parser.add_argument("--use_orthogonal_init", type=bool, default=True, help="Orthogonal initialization")
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
-    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="The norm of the gradient clip")
+    parser.add_argument("--grad_clip_norm", type=float, default=10, help="The norm of the gradient clip")
     parser.add_argument("--use_lr_decay", type=bool, default=False, help="use lr decay")
     parser.add_argument("--use_RMS", type=bool, default=True, help="Whether to use RMS")
     parser.add_argument("--use_Adam", type=bool, default=False, help="Whether to use Adam")
-    parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
+    parser.add_argument("--add_last_action", type=bool, default=False, help="Whether to add last actions into the observation")
     parser.add_argument("--use_double_q", type=bool, default=True, help="Whether to use double q-learning")
     parser.add_argument("--use_hard_update", type=bool, default=True, help="Whether to use hard update")
     parser.add_argument("--target_update_freq", type=int, default=200, help="Update frequency of the target network")
@@ -361,6 +366,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
 
+    if args.use_rnn is False:
+        print("Only RNN is supported. Reverting to RNN.")
+        args.use_rnn = True
+
+
     # check if cuda available
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # args.device = torch.device("mps")
@@ -372,6 +382,6 @@ if __name__ == '__main__':
 
     env_names = ['3m', '8m', '2s3z']
     env_index = 0
-    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id=5171208, seed=0)
+    runner = QTRAN_Base_Runner(args, env_name=env_names[env_index], exp_id=5191138, seed=0)
     runner.run()
         
