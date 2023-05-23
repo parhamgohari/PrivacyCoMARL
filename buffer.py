@@ -64,7 +64,7 @@ class ReplayBuffer:
         if not self.use_poisson_sampling:
             index = torch.randint(0, self.current_size, size=(self.batch_size, ))
         else:
-            index = torch.where(torch.rand(self.current_size) < self.batch_size/self.buffer_size).flatten()
+            index = torch.where(torch.rand(self.current_size) < self.batch_size/self.buffer_size)[0]
 
         if index.shape[0] ==0:
             return None, None, None

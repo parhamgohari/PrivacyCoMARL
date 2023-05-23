@@ -2,15 +2,17 @@ import torch
 from smac.env import StarCraft2Env
 import numpy as np
 import argparse
-from QTRAN_agent import QTRAN_Base_Agent
-from network import Q_jt_network_MLP, V_jt_network_MLP
+from QTRAN_agent import QTRAN_Base_Agent, QTRAN_Alt_Agent
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import time
+import os
+import json
+import datetime
 
 
 
-class QTRAN_Base_Runner(object):
+class QTRAN_Runner(object):
     def __init__(self, args, env_name, exp_id, seed, privacy_mechanism = None):
         self.args = args
         self.env_name = env_name
@@ -33,7 +35,6 @@ class QTRAN_Base_Runner(object):
         self.epsilon = self.args.epsilon
 
         if args.use_dp:
-            raise NotImplementedError
             self.privacy_budget = {
                 'epsilon': 0,
                 'delta': 0,
@@ -43,9 +44,13 @@ class QTRAN_Base_Runner(object):
             raise NotImplementedError
             self.anchor_threshold = 0.5
 
-        # create n_agents VDN agents
-        self.agents = [QTRAN_Base_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
-
+        # create agents
+        if args.algorithm == 'QTRAN-base':
+            self.agents = [QTRAN_Base_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
+        elif args.algorithm == 'QTRAN-alt':
+            self.agents = [QTRAN_Alt_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
+        else:
+            raise NotImplementedError
         # creat a tensorboard
         self.writer = SummaryWriter(log_dir="./log/{}_{}_{}".format(self.args.algorithm, env_name, exp_id))
 
@@ -221,7 +226,6 @@ class QTRAN_Base_Runner(object):
                 
 
             if self.args.use_dp:
-                raise NotImplementedError
                 if min([agent.replay_buffer.current_size for agent in self.agents]) == self.args.buffer_size and not dp_measured:
                     self.privacy_budget = {
                         'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) /self.args.buffer_throughput,
@@ -306,31 +310,21 @@ class QTRAN_Base_Runner(object):
                     episode_step = episode_step+1,
                     obs = self.env.get_obs_agent(agents.id),
                     avail_a = self.env.get_avail_agent_actions(agents.id)
-                    )
+                )
+
 
         return win_tag, episode_reward, episode_step + 1
-    
-
-
-            
-
-        
                 
 
-
-
-
-
-
-
+        
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hyperparameter Setting for QTRAN in SMAC environment")
-    parser.add_argument("--max_train_steps", type=int, default=int(1e6), help=" Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(6e5), help=" Maximum number of training steps")
     parser.add_argument("--evaluate_freq", type=float, default=5000, help="Evaluate the policy every 'evaluate_freq' steps")
     parser.add_argument("--evaluate_times", type=float, default=20, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
-
-    parser.add_argument("--algorithm", type=str, default="QTRAN", help="QMIX or VDN")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--algorithm", type=str, default="QTRAN-alt", help="QMIX or VDN")
     parser.add_argument("--epsilon", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon_decay_steps", type=float, default=50000, help="How many steps before the epsilon decays to the minimum")
     parser.add_argument("--epsilon_min", type=float, default=0.05, help="Minimum epsilon")
@@ -338,23 +332,23 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (the number of episodes)")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lambda_opt", type=float, default=1, help="The coefficient of the factorizing error for optimal actions regularization term")
-    parser.add_argument("--lambda_nopt", type=float, default=0.1, help="The coefficient of the factorizing error for non-optimal actions regularization term")
+    parser.add_argument("--lambda_opt", type=float, default=0.1, help="The coefficient of the factorizing error for optimal actions regularization term")
+    parser.add_argument("--lambda_nopt", type=float, default=1, help="The coefficient of the factorizing error for non-optimal actions regularization term")
     parser.add_argument("--rnn_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of RNN")
     parser.add_argument("--mlp_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of MLP")
-    parser.add_argument("--use_rnn", type=bool, default=True, help="Whether to use RNN")
+    parser.add_argument("--use_rnn", type=bool, default=False, help="Whether to use RNN")
     parser.add_argument("--use_orthogonal_init", type=bool, default=True, help="Orthogonal initialization")
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
-    parser.add_argument("--grad_clip_norm", type=float, default=10, help="The norm of the gradient clip")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="The norm of the gradient clip")
     parser.add_argument("--use_lr_decay", type=bool, default=False, help="use lr decay")
-    parser.add_argument("--use_RMS", type=bool, default=True, help="Whether to use RMS")
-    parser.add_argument("--use_Adam", type=bool, default=False, help="Whether to use Adam")
-    parser.add_argument("--add_last_action", type=bool, default=False, help="Whether to add last actions into the observation")
+    parser.add_argument("--use_RMS", type=bool, default=False, help="Whether to use RMS")
+    parser.add_argument("--use_Adam", type=bool, default=True, help="Whether to use Adam")
+    parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
     parser.add_argument("--use_double_q", type=bool, default=True, help="Whether to use double q-learning")
     parser.add_argument("--use_hard_update", type=bool, default=True, help="Whether to use hard update")
     parser.add_argument("--target_update_freq", type=int, default=200, help="Update frequency of the target network")
     parser.add_argument("--tau", type=int, default=0.005, help="If use soft update")
-    parser.add_argument("--use_secret_sharing", type=bool, default=False, help="Whether to use secret sharing")
+    parser.add_argument("--use_secret_sharing", type=bool, default=True, help="Whether to use secret sharing")
     parser.add_argument("--use_poisson_sampling", type=bool, default=False, help="Whether to use poisson sampling")
     parser.add_argument("--use_dp", type=bool, default=False, help="Whether to use differential privacy")
     parser.add_argument("--noise_multiplier", type=float, default=0.8, help="Noise multiplier")
@@ -366,22 +360,31 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
 
-    if args.use_rnn is False:
-        print("Only RNN is supported. Reverting to RNN.")
-        args.use_rnn = True
 
 
-    # check if cuda available
-    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # args.device = torch.device("mps")
+    args.device = 'cpu'
 
     if args.use_dp:
         args.use_poison_sampling = True
         args.use_grad_clip = True
         args.delta = args.buffer_size**(-1.1) * args.buffer_throughput
 
+    # Use todays date and time as exp_id
+    args.exp_id = datetime.datetime.now().strftime("%m%d-%H%M")
+
+
+
+
     env_names = ['3m', '8m', '2s3z']
     env_index = 0
-    runner = QTRAN_Base_Runner(args, env_name=env_names[env_index], exp_id=5191138, seed=0)
+
+        # Log the configs in a json file
+    if not os.path.exists('./configs'):
+        os.makedirs('./configs')
+    with open('./configs/{}_env_{}_number_{}_seed_{}.json'.format(args.algorithm, env_names[env_index], args.exp_id, args.seed), 'w') as f:
+        json.dump(args.__dict__, f, indent=2)
+
+
+    runner = QTRAN_Runner(args, env_names[env_index], args.exp_id, args.seed)
     runner.run()
         
