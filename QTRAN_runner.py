@@ -2,13 +2,14 @@ import torch
 from smac.env import StarCraft2Env
 import numpy as np
 import argparse
-from QTRAN_agent import QTRAN_Base_Agent, QTRAN_Alt_Agent
+from QTRAN_agent import QTRAN_Base_Agent
+from network import Q_jt_network_MLP, V_jt_network_MLP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import time
+import datetime
 import os
 import json
-import datetime
 
 
 
@@ -44,13 +45,9 @@ class QTRAN_Runner(object):
             raise NotImplementedError
             self.anchor_threshold = 0.5
 
-        # create agents
-        if args.algorithm == 'QTRAN-base':
-            self.agents = [QTRAN_Base_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
-        elif args.algorithm == 'QTRAN-alt':
-            self.agents = [QTRAN_Alt_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
-        else:
-            raise NotImplementedError
+        # create n_agents VDN agents
+        self.agents = [QTRAN_Base_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
+
         # creat a tensorboard
         self.writer = SummaryWriter(log_dir="./log/{}_{}_{}".format(self.args.algorithm, env_name, exp_id))
 
@@ -67,7 +64,6 @@ class QTRAN_Runner(object):
     def run(self):
         evaluate_num = -1
         pbar = tqdm(total = self.total_steps)
-        dp_measured = False
         episode_num = 0
         losses = []
         while self.total_steps < self.args.max_train_steps:
@@ -75,9 +71,8 @@ class QTRAN_Runner(object):
                 self.evaluate_policy()
                 if len(losses) != 0:
                     print('-----------------------------------------------------------------------------------')
-                    print(losses[-3])
-                    print(losses[-2])
-                    print(losses[-1])
+                    for i in range(self.n_agents):
+                        print(losses[-i-1])
                     print('-----------------------------------------------------------------------------------')
                     print('\n')
                 if self.args.use_anchoring:
@@ -223,15 +218,13 @@ class QTRAN_Runner(object):
                     verbose = agent.train(self.total_steps)
                     losses.append(verbose)
 
-                
 
             if self.args.use_dp:
-                if min([agent.replay_buffer.current_size for agent in self.agents]) == self.args.buffer_size and not dp_measured:
-                    self.privacy_budget = {
-                        'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) /self.args.buffer_throughput,
-                        'delta': self.args.delta /self.args.buffer_throughput
-                    }
-                    dp_measured = True
+                self.privacy_budget = {
+                    'epsilon': max([agent.accountant.get_epsilon(self.args.delta) for agent in self.agents]) /self.args.buffer_throughput,
+                    'delta': self.args.delta /self.args.buffer_throughput
+                }
+
 
         self.evaluate_policy()
         self.env.close()
@@ -266,7 +259,7 @@ class QTRAN_Runner(object):
         self.env.reset()
         for agent in self.agents:
             if self.args.use_rnn:
-                agent.q_network.rnn_hidden = None
+                agent.q_network.hidden = None
 
         for episode_step in range(self.args.episode_limit):
             # get observations
@@ -310,21 +303,31 @@ class QTRAN_Runner(object):
                     episode_step = episode_step+1,
                     obs = self.env.get_obs_agent(agents.id),
                     avail_a = self.env.get_avail_agent_actions(agents.id)
-                )
-
+                    )
 
         return win_tag, episode_reward, episode_step + 1
-                
+    
+
+
+            
 
         
+                
+
+
+
+
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("Hyperparameter Setting for QTRAN in SMAC environment")
-    parser.add_argument("--max_train_steps", type=int, default=int(6e5), help=" Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(2e6), help=" Maximum number of training steps")
     parser.add_argument("--evaluate_freq", type=float, default=5000, help="Evaluate the policy every 'evaluate_freq' steps")
     parser.add_argument("--evaluate_times", type=float, default=20, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--algorithm", type=str, default="QTRAN-alt", help="QMIX or VDN")
+    parser.add_argument("--algorithm", type=str, default="QTRAN", help="QTRAN")
     parser.add_argument("--epsilon", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon_decay_steps", type=float, default=50000, help="How many steps before the epsilon decays to the minimum")
     parser.add_argument("--epsilon_min", type=float, default=0.05, help="Minimum epsilon")
@@ -332,8 +335,8 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (the number of episodes)")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--lambda_opt", type=float, default=0.1, help="The coefficient of the factorizing error for optimal actions regularization term")
-    parser.add_argument("--lambda_nopt", type=float, default=1, help="The coefficient of the factorizing error for non-optimal actions regularization term")
+    parser.add_argument("--lambda_opt", type=float, default=1, help="The coefficient of the factorizing error for optimal actions regularization term")
+    parser.add_argument("--lambda_nopt", type=float, default=0.1, help="The coefficient of the factorizing error for non-optimal actions regularization term")
     parser.add_argument("--rnn_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of RNN")
     parser.add_argument("--mlp_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of MLP")
     parser.add_argument("--use_rnn", type=bool, default=False, help="Whether to use RNN")
@@ -341,8 +344,8 @@ if __name__ == '__main__':
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="The norm of the gradient clip")
     parser.add_argument("--use_lr_decay", type=bool, default=False, help="use lr decay")
-    parser.add_argument("--use_RMS", type=bool, default=False, help="Whether to use RMS")
-    parser.add_argument("--use_Adam", type=bool, default=True, help="Whether to use Adam")
+    parser.add_argument("--use_RMS", type=bool, default=True, help="Whether to use RMS")
+    parser.add_argument("--use_Adam", type=bool, default=False, help="Whether to use Adam")
     parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
     parser.add_argument("--use_double_q", type=bool, default=True, help="Whether to use double q-learning")
     parser.add_argument("--use_hard_update", type=bool, default=True, help="Whether to use hard update")
@@ -360,7 +363,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
 
-
+    assert (args.use_Adam and args.use_RMS) == False, "Cannot use both Adam and RMSProp"
 
     args.device = 'cpu'
 
@@ -375,7 +378,7 @@ if __name__ == '__main__':
 
 
 
-    env_names = ['3m', '8m', '2s3z']
+    env_names = ['3m', '3s_vs_4z', '2s3z']
     env_index = 0
 
         # Log the configs in a json file

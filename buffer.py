@@ -66,17 +66,30 @@ class ReplayBuffer:
         else:
             index = torch.where(torch.rand(self.current_size) < self.batch_size/self.buffer_size)[0]
 
+
         if index.shape[0] ==0:
             return None, None, None
         
-        max_episode_len = int(np.max(self.episode_len[index]))
-        batch = {}
-        for key in self.buffer.keys():
-            if key == 'obs' or key == 'avail_a' or key == 'last_onehot_a':
-                batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len + 1], dtype=torch.float32, device=self.device)
-            elif key == 'a':
-                batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len], dtype=torch.long, device=self.device)
-            else:
-                batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len], dtype=torch.float32, device=self.device)
+        elif index.shape[0] == 1:
+            max_episode_len = int(np.max(self.episode_len[index]))
+            batch = {}
+            for key in self.buffer.keys():
+                if key == 'obs' or key == 'avail_a' or key == 'last_onehot_a':
+                    batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len + 1], dtype=torch.float32, device=self.device).unsqueeze(0)
+                elif key == 'a':
+                    batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len], dtype=torch.long, device=self.device).unsqueeze(0)
+                else:
+                    batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len], dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        else:
+            max_episode_len = int(np.max(self.episode_len[index]))
+            batch = {}
+            for key in self.buffer.keys():
+                if key == 'obs' or key == 'avail_a' or key == 'last_onehot_a':
+                    batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len + 1], dtype=torch.float32, device=self.device)
+                elif key == 'a':
+                    batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len], dtype=torch.long, device=self.device)
+                else:
+                    batch[key] = torch.tensor(self.buffer[key][index, :max_episode_len], dtype=torch.float32, device=self.device)
 
         return batch, max_episode_len, index.shape[0]
