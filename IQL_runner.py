@@ -2,14 +2,14 @@ import torch
 from smac.env import StarCraft2Env
 import numpy as np
 import argparse
-from agent import VDN_Agent
+from IQL_agent import IQL_Agent
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import time
 
 
 
-class VDN_Runner(object):
+class IQL_Runner(object):
     def __init__(self, args, env_name, exp_id, seed, privacy_mechanism = None):
         self.args = args
         self.env_name = env_name
@@ -41,7 +41,7 @@ class VDN_Runner(object):
 
         _, self.seed = self.branch_seed(self.seed)
         # create n_agents VDN agents
-        self.agents = [VDN_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
+        self.agents = [IQL_Agent(self.args, id, self.seed) for id in range(self.args.n_agents)]
 
         # creat a tensorboard
         self.writer = SummaryWriter(log_dir="./log/{}_{}_{}".format(self.args.algorithm, env_name, exp_id))
@@ -81,33 +81,10 @@ class VDN_Runner(object):
 
             
             # start training if all agent replay buffer has enough samples
-            if min([agent.replay_buffer.current_size for agent in self.agents]) >= self.args.batch_size:
+            if min([agent.replay_buffer.current_size for agent in self.agents]) >= self.args.buffer_size if self.args.use_dp else self.args.batch_size:
                 #create an np array of size batch_size * n_agents (sender) * n_agents (receiver)
-                skip_iteration = False
                 for agent in self.agents:
-                    agent.peer2peer_messaging(self.seed, mode = '0. initiate')
-                    if agent.empty_batch:
-                        skip_iteration = True
-                        break
-                if skip_iteration:
-                    continue
-                for agent in self.agents:
-                    agent.peer2peer_messaging(self.seed, mode = '1. compute message')
-                local_sums = []
-                for receiver_agent in self.agents:
-                    for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging(self.seed, mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:, receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging(self.seed, mode = '3. compute sum'))
-                local_sums = torch.stack(local_sums)
-                
-                if not self.args.use_secret_sharing:
-                    sum_shares = torch.sum(local_sums, dim = 0)
-                        
-                for agent in self.agents:
-                    if self.args.use_secret_sharing:
-                        agent.train(self.total_steps, agent.decrypt(local_sums))
-                    else:
-                        agent.train(self.total_steps, sum_shares)
+                    agent.train(self.total_steps)
                 _, self.seed = self.branch_seed(self.seed)
 
             if self.args.use_dp:
@@ -153,15 +130,15 @@ class VDN_Runner(object):
         self.env.reset()
         for agent in self.agents:
             if self.args.use_rnn:
-                agent.q_network.rnn_hidden = None
+                agent.q_network.encoder.hidden = None
         joint_last_onehot_a = np.zeros((self.n_agents, self.args.action_dim))
 
         for episode_step in range(self.args.episode_limit):
-            # get observations
-            joint_obs = self.env.get_obs()
+            for agent in self.agents:
+                agent.observation = self.env.get_obs_agent(agent.id)
             joint_avail_a = self.env.get_avail_actions()
             epsilon = 0 if evaluate else self.epsilon
-            joint_action = [agent.choose_action(joint_obs[agent.id], joint_last_onehot_a[agent.id], joint_avail_a[agent.id], epsilon, use_anchor_q) for agent in self.agents]
+            joint_action = [agent.choose_action(self.env.get_obs_agent(agent.id), joint_last_onehot_a[agent.id], joint_avail_a[agent.id], epsilon, use_anchor_q) for agent in self.agents]
             joint_last_onehot_a = np.eye(self.args.action_dim)[joint_action]
 
             try:
@@ -187,7 +164,7 @@ class VDN_Runner(object):
                     
                     agent.replay_buffer.store_transition(
                         episode_step = episode_step,
-                        obs = joint_obs[agent.id],
+                        obs = agent.observation,
                         avail_a = joint_avail_a[agent.id],
                         last_onehot_a = joint_last_onehot_a[agent.id],
                         a = joint_action[agent.id],
@@ -202,26 +179,16 @@ class VDN_Runner(object):
                 break
 
         if not evaluate:
-            joint_obs = self.env.get_obs()
             joint_avail_a = self.env.get_avail_actions()
             for agents in self.agents:
                 agents.replay_buffer.store_last_step(
                     episode_step = episode_step,
-                    obs = joint_obs[agents.id],
+                    obs = self.env.get_obs_agent(agents.id),
                     avail_a = joint_avail_a[agents.id]
                     )
 
         return win_tag, episode_reward, episode_step + 1
     
-
-
-            
-
-        
-                
-
-
-
 
 
 
@@ -233,20 +200,20 @@ if __name__ == '__main__':
     parser.add_argument("--evaluate_times", type=float, default=32, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
 
-    parser.add_argument("--algorithm", type=str, default="VDN", help="QMIX or VDN")
+    parser.add_argument("--algorithm", type=str, default="IQL", help="QMIX or VDN")
     parser.add_argument("--epsilon", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon_decay_steps", type=float, default=50000, help="How many steps before the epsilon decays to the minimum")
     parser.add_argument("--epsilon_min", type=float, default=0.05, help="Minimum epsilon")
-    parser.add_argument("--buffer_size", type=int, default=1024, help="The capacity of the replay buffer")
+    parser.add_argument("--buffer_size", type=int, default=5000, help="The capacity of the replay buffer")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (the number of episodes)")
-    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--rnn_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of RNN")
     parser.add_argument("--mlp_hidden_dim", type=int, default=64, help="The dimension of the hidden layer of MLP")
-    parser.add_argument("--use_rnn", type=bool, default=False, help="Whether to use RNN")
+    parser.add_argument("--use_rnn", type=bool, default=True, help="Whether to use RNN")
     parser.add_argument("--use_orthogonal_init", type=bool, default=True, help="Orthogonal initialization")
     parser.add_argument("--use_grad_clip", type=bool, default=True, help="Gradient clip")
-    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="The norm of the gradient clip")
+    parser.add_argument("--grad_clip_norm", type=float, default=10, help="The norm of the gradient clip")
     parser.add_argument("--use_lr_decay", type=bool, default=True, help="use lr decay")
     parser.add_argument("--use_RMS", type=bool, default=False, help="Whether to use RMS,if False, we will use Adam")
     parser.add_argument("--add_last_action", type=bool, default=True, help="Whether to add last actions into the observation")
@@ -255,12 +222,12 @@ if __name__ == '__main__':
     parser.add_argument("--target_update_freq", type=int, default=200, help="Update frequency of the target network")
     parser.add_argument("--tau", type=int, default=0.005, help="If use soft update")
     parser.add_argument("--use_secret_sharing", type=bool, default=True, help="Whether to use secret sharing")
-    parser.add_argument("--use_poisson_sampling", type=bool, default=True, help="Whether to use poisson sampling")
-    parser.add_argument("--use_dp", type=bool, default=True, help="Whether to use differential privacy")
+    parser.add_argument("--use_poisson_sampling", type=bool, default=False, help="Whether to use poisson sampling")
+    parser.add_argument("--use_dp", type=bool, default=False, help="Whether to use differential privacy")
     parser.add_argument("--noise_multiplier", type=float, default=0.8, help="Noise multiplier")
     parser.add_argument("--delta", type=float, default=None, help="Delta")
     parser.add_argument("--buffer_throughput", type=float, default=1.0, help="Buffer throughput")
-    parser.add_argument("--use_anchoring", type=bool, default=True, help="Whether to use anchoring")
+    parser.add_argument("--use_anchoring", type=bool, default=False, help="Whether to use anchoring")
 
 
     args = parser.parse_args()
@@ -277,6 +244,6 @@ if __name__ == '__main__':
 
     env_names = ['3m', '8m', '2s3z']
     env_index = 0
-    runner = VDN_Runner(args, env_name=env_names[env_index], exp_id=4021257, seed=0)
+    runner = IQL_Runner(args, env_name=env_names[env_index], exp_id=4021257, seed=0)
     runner.run()
         

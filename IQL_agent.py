@@ -9,7 +9,7 @@ from opacus.accountants import RDPAccountant
 
 
 
-class VDN_Agent(object):
+class IQL_Agent(object):
     def __init__(self, args, id, seed):
         args.id = id
         self.id = id
@@ -123,128 +123,39 @@ class VDN_Agent(object):
                 q_values[avail_a == 0.0] = -float('inf')
                 a = torch.max(q_values, dim=0)[1].item()
             return a
-    
-    # Fixed point encoding
-    def encoder(self, x):
-        encoding = (self.base**self.precision * x % self.Q).clone().detach().int()
-        return encoding
-
-    # Fixed point decoding
-    def decoder(self, x):
-        x[x > self.Q/2] = x[x > self.Q/2] - self.Q
-        return x / self.base**self.precision
-    
-    # Additive secret sharing
-    def encrypt(self, x):
-        shares = []
-        for i in range(self.n_agents-1): 
-            shares.append(torch.randint(0, self.Q, x.shape, device=self.device))
-        shares.append(self.Q - sum(shares) % self.Q + self.encoder(x))
-        shares = torch.stack(shares, dim=0)
-        # swap the first dimension with the last dimension
-        shares = shares.permute(1, 2, 0)
-        return shares
-    
-    def decrypt(self, shares):
-        return self.decoder(torch.sum(shares, dim=0) % self.Q)
 
 
-    def peer2peer_messaging(self, seed, mode, sender_id = None, sender_message = None):
-        if '0' in mode:
-            self.batch, self.max_episode_len, batch_length = self.replay_buffer.sample(seed)
-            if self.use_poisson_sampling and batch_length is not None:
-                self.current_batch_size = batch_length
-            elif not self.use_poisson_sampling:
-                self.current_batch_size = self.batch_size
-            elif batch_length is None:
-                self.empty_batch = True
-                return
-            
-            self.empty_batch = False
-
-
-            self.inputs = self.get_inputs(self.batch).clone().detach() # dimension: batch_size * max_episode_len * input_dim
-            #self.message_to_send = empty tensor with shape (batch_size, max_episode_len, n_agents)
-            self.message_to_send = torch.zeros((self.current_batch_size, self.max_episode_len, self.n_agents), device=self.device, dtype=torch.float32)
-            self.message_to_rece = torch.zeros((self.current_batch_size, self.max_episode_len, self.n_agents), device=self.device, dtype=torch.float32)
-            self.train_step += 1
-            if self.use_rnn:
-                self.q_network.encoder.hidden = None
-                self.target_q_network.encoder.hidden = None
-        elif '1' in mode:
-            # if self.use_rnn:
-            #     self.q_evals, self.q_targets = [], []
-            #     for t in range(self.max_episode_len):  # t=0,1,2,...(episode_len-1)
-            #         if self.use_dp:
-            #             self.q_eval = []
-            #             self.q_target = []
-            #             if self.use_double_q:
-            #                 q_eval_last = []
-            #             for sample in range(self.current_batch_size):
-            #                 self.q_eval.append(self.q_network(self.inputs[sample, t, :].reshape(self.input_dim)))  
-            #                 self.q_target.append(self.target_q_network(self.inputs[sample, t + 1, :].reshape(self.input_dim)))
-            #                 if t == self.max_episode_len - 1 and self.use_double_q:
-            #                     q_eval_last.append(self.q_network(self.inputs[sample, t + 1, :].reshape(self.input_dim)))
+    def train(self, total_steps):
+        self.batch, self.max_episode_len, batch_length = self.replay_buffer.sample(self.seed)
+        if self.use_poisson_sampling and batch_length is not None:
+            self.current_batch_size = batch_length
+        elif not self.use_poisson_sampling:
+            self.current_batch_size = self.batch_size
+        elif batch_length is None:
+            return
         
-            #             self.q_eval = torch.stack(self.q_eval, dim=0)
-            #             self.q_target = torch.stack(self.q_target, dim=0)
+        if self.use_rnn:
+            self.q_network.encoder.hidden = None
+            self.target_q_network.encoder.hidden = None
 
-            #         else:
-            #             self.q_eval = self.q_network(self.inputs[:, t].reshape(-1, self.input_dim))  # q_eval.shape=(batch_size,action_dim)
-            #             self.q_target = self.target_q_network(self.inputs[:, t + 1].reshape(-1, self.input_dim))
-            #         self.q_evals.append(self.q_eval.reshape(self.current_batch_size, -1))  # q_eval.shape=(batch_size,action_dim)
-            #         self.q_targets.append(self.q_target.reshape(self.current_batch_size, -1))
-
-            #     # Stack them according to the time (dim=1)
-            #     self.q_evals = torch.stack(self.q_evals, dim=1)  # q_evals.shape=(batch_size,max_episode_len,action_dim)
-            #     self.q_targets = torch.stack(self.q_targets, dim=1)
-            # else:
-            #     self.q_evals = self.q_network(self.inputs[:, :-1])  # q_evals.shape=(batch_size,max_episode_len,action_dim)
-            #     self.q_targets = self.target_q_network(self.inputs[:, 1:])
-            
-            self.q_evals = self.q_network(self.inputs[:, :-1])  # q_evals.shape=(batch_size,max_episode_len,action_dim)
-            self.q_targets = self.target_q_network(self.inputs)[:, 1:]
-            with torch.no_grad():
-                if self.use_double_q:  # If use double q-learning, we use eval_net to choose actions,and use target_net to compute q_target
-                    q_eval_last = self.q_network(self.inputs[:, -1].unsqueeze(1)).reshape(self.current_batch_size, 1, -1)
-                    q_evals_next = torch.cat([self.q_evals[:, 1:], q_eval_last], dim=1) # q_evals_next.shape=(batch_size,max_episode_len,action_dim)
-                    q_evals_next[self.batch['avail_a'][:, 1:] == 0] = -999999
-                    a_argmax = torch.argmax(q_evals_next, dim=-1, keepdim=True)  # a_max.shape=(batch_size,max_episode_len, 1)
-                    self.q_targets = torch.gather(self.q_targets, dim=-1, index=a_argmax).squeeze(-1)  # q_targets.shape=(batch_size, max_episode_len)
-                else:
-                    self.q_targets[self.batch['avail_a'][:, 1:] == 0] = -999999
-                    self.q_targets = self.q_targets.max(dim=-1)[0]  # q_targets.shape=(batch_size, max_episode_len)
-
-            
-            self.q_evals = torch.gather(self.q_evals, dim=-1, index=self.batch['a'].unsqueeze(-1)).squeeze(-1)  # q_evals.shape(batch_size, max_episode_len)
-            # make n_agent copies of q_evals and q_targets each of which multiplied by 1/n_agents
-            with torch.no_grad():
-                if self.use_secret_sharing:
-                    self.secret = self.q_evals - ((1.0/self.n_agents) * self.batch['r'].squeeze(-1) + self.gamma * (1-self.batch['dw'].squeeze(-1)) * self.q_targets)
-                    self.secret_shares = self.encrypt(self.secret)
-                else:
-                    self.secret = self.q_evals - ((1.0/self.n_agents) * self.batch['r'].squeeze(-1) + self.gamma * (1-self.batch['dw'].squeeze(-1)) * self.q_targets)
-                    self.secret_shares = self.secret.unsqueeze(-1).repeat(1, 1, self.n_agents) / self.n_agents # q_evals.shape=(batch_size, max_episode_len, n_agents, n_agents)
-    
-
-        elif '2' in mode:
-            self.message_to_rece[:,:,sender_id] = sender_message
-
-        elif '3' in mode:
-            if self.use_secret_sharing:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=2) % self.Q
+        self.empty_batch = False
+        self.inputs = self.get_inputs(self.batch).clone().detach() # dimension: batch_size * max_episode_len * input_dim
+        self.q_evals = self.q_network(self.inputs[:, :-1])  # q_evals.shape=(batch_size,max_episode_len,action_dim)
+        self.q_targets = self.target_q_network(self.inputs)[:, 1:]
+        with torch.no_grad():
+            if self.use_double_q:  # If use double q-learning, we use eval_net to choose actions,and use target_net to compute q_target
+                q_eval_last = self.q_network(self.inputs[:, -1].unsqueeze(1)).reshape(self.current_batch_size, 1, -1)
+                q_evals_next = torch.cat([self.q_evals[:, 1:], q_eval_last], dim=1) # q_evals_next.shape=(batch_size,max_episode_len,action_dim)
+                q_evals_next[self.batch['avail_a'][:, 1:] == 0] = -999999
+                a_argmax = torch.argmax(q_evals_next, dim=-1, keepdim=True)  # a_max.shape=(batch_size,max_episode_len, 1)
+                self.q_targets = torch.gather(self.q_targets, dim=-1, index=a_argmax).squeeze(-1)  # q_targets.shape=(batch_size, max_episode_len)
             else:
-                self.sum_shares = torch.sum(self.message_to_rece, dim=2)  # sum_q_vals.shape=(batch_size, max_episode_len)
-            return self.sum_shares
-
-            
-            
-
-    def train(self, total_steps, sum_shares):
-        td_error = sum_shares - self.q_evals.detach()
-        td_error += self.q_evals
-        mask_td_error = td_error * self.batch['active'].squeeze(-1)
-
+                self.q_targets[self.batch['avail_a'][:, 1:] == 0] = -999999
+                self.q_targets = self.q_targets.max(dim=-1)[0]
+        
+        targets = self.batch['r'] + self.gamma * self.q_targets.unsqueeze(-1) * (1 - self.batch['dw'])  # targets.shape=(batch_size, max_episode_len)
+        td_error = self.q_evals.gather(dim=-1, index=self.batch['a'].unsqueeze(-1)) - targets.detach()
+        mask_td_error = td_error * self.batch['active']
         loss = (mask_td_error ** 2).sum() / self.batch['active'].sum()
 
         if self.use_anchoring:

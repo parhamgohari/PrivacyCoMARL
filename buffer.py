@@ -13,8 +13,6 @@ class ReplayBuffer:
         self.batch_size = args.batch_size
         self.episode_num = 0
         self.current_size = 0
-        self.use_rnn = args.use_rnn
-        self.rnn_hidden_dim = args.rnn_hidden_dim
         self.device = args.device
         self.use_poisson_sampling = args.use_poisson_sampling
         
