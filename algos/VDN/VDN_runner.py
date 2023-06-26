@@ -70,7 +70,6 @@ class VDN_Runner(Runner_Base):
                 for agent in self.agents:
                     verbose.append(agent.train(self.total_steps))
                 
-                self.epsilon = self.epsilon - self.total_steps * self.args.epsilon_decay if self.epsilon - self.args.epsilon_decay > self.args.epsilon_min else self.args.epsilon_min
 
             if self.args.use_dp:
                 self.privacy_budget = {

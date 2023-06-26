@@ -47,22 +47,41 @@ class QTRAN_Runner(Runner_Base):
                         break
                 self.update_seed()
                 if skip_iteration:
-                    return True
+                    continue
                 
+                # First round of peer2peer messaging 
                 for agent in self.agents:
-                    agent.peer2peer_messaging(mode = '1. compute message')
+                    agent.peer2peer_messaging_pt1(mode = '1. compute message')
                 local_sums = []
                 for receiver_agent in self.agents:
                     for sender_agent in self.agents:
-                        receiver_agent.peer2peer_messaging(mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
-                    local_sums.append(receiver_agent.peer2peer_messaging(mode = '3. compute sum'))
+                        receiver_agent.peer2peer_messaging_pt1(mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_pt1(mode = '3. compute sum'))
                 local_sums = torch.stack(local_sums)
 
                 for agent in self.agents:
                     if self.args.use_secret_sharing:
-                        agent.peer2peer_messaging(mode = '4. receive the sum of local sums', sender_message = local_sums)
+                        agent.peer2peer_messaging_pt1(mode = '4. receive the sum of local sums', sender_message = local_sums)
                     else:
-                        agent.peer2peer_messaging(mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+                        agent.peer2peer_messaging_pt1(mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
+
+                # Second round of peer2peer messaging
+                for agent in self.agents:
+                    agent.peer2peer_messaging_pt2(mode = '1. compute message')
+                local_sums = []
+                for receiver_agent in self.agents:
+                    for sender_agent in self.agents:
+                        receiver_agent.peer2peer_messaging_pt2(mode = '2. receive message', sender_id = sender_agent.id, sender_message = sender_agent.secret_shares[:,:,:,receiver_agent.id])
+                    local_sums.append(receiver_agent.peer2peer_messaging_pt2(mode = '3. compute sum'))
+                local_sums = torch.stack(local_sums)
+
+                for agent in self.agents:
+                    if self.args.use_secret_sharing:
+                        agent.peer2peer_messaging_pt2(mode = '4. receive the sum of local sums', sender_message = local_sums)
+                    else:
+                        agent.peer2peer_messaging_pt2(mode = '4. receive the sum of local sums', sender_message = torch.sum(local_sums, dim = 0))
+
 
                 # train
                 for agent in self.agents:

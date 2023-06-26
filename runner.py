@@ -15,7 +15,7 @@ if __name__ == '__main__':
     parser.add_argument("--evaluate_times", type=float, default=32, help="Evaluate times")
     parser.add_argument("--save_freq", type=int, default=int(1e5), help="Save frequency")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--algorithm", type=str, default="VDN", help="IQL, VDN, QMIX, or QTRAN")
+    parser.add_argument("--algorithm", type=str, default="QTRAN", help="IQL, VDN, QMIX, or QTRAN")
     parser.add_argument("--epsilon", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon_decay_steps", type=float, default=50000, help="How many steps before the epsilon decays to the minimum")
     parser.add_argument("--epsilon_min", type=float, default=0.05, help="Minimum epsilon")
@@ -55,7 +55,7 @@ if __name__ == '__main__':
     parser.add_argument("--delta", type=float, default=None, help="Delta")
     parser.add_argument("--buffer_throughput", type=float, default=1.0, help="Buffer throughput")
     parser.add_argument("--use_anchoring", type=bool, default=False, help="Whether to use anchoring")
-    parser.add_argument("--log_and_save", type=bool, default=True, help="Whether to log and save")
+    parser.add_argument("--log_and_save", type=bool, default=False, help="Whether to log and save")
 
     args = parser.parse_args()
     args.epsilon_decay = (args.epsilon - args.epsilon_min) / args.epsilon_decay_steps
